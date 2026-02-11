@@ -1,0 +1,17 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# User calibration profiles (personal data)
+user_profiles/*.pkl
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
