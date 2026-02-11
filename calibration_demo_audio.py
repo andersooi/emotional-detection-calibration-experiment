@@ -191,6 +191,12 @@ class AudioCalibrationDemoApp:
         self.capture_start_time = 0.0
         self.captured_audio: List[np.ndarray] = []
 
+        # Prediction smoothing (to reduce jumping between emotions)
+        self.prediction_history: List[Dict] = []
+        self.smoothing_window = 3  # Number of predictions to average
+        self.current_smoothed_emotion = "Neutral"
+        self.emotion_change_threshold = 2  # Need N consecutive different predictions to change
+
         # Metrics
         self.inference_time = 0.0
         self.chunks_processed = 0
@@ -645,25 +651,92 @@ class AudioCalibrationDemoApp:
         messagebox.showinfo("Profile Loaded", f"Audio profile '{user_id}' loaded successfully.")
 
     # ========================================================================
+    # Prediction Smoothing
+    # ========================================================================
+
+    def get_smoothed_prediction(self, calibrated: Dict) -> Dict:
+        """
+        Smooth predictions over a window to reduce jumping.
+
+        Uses majority voting over recent predictions with hysteresis.
+        """
+        # Add to history
+        self.prediction_history.append({
+            'emotion': calibrated.get('emotion', 'Neutral'),
+            'confidence': calibrated.get('confidence', 0.0),
+            'emotion_source': calibrated.get('emotion_source', 'unknown')
+        })
+
+        # Keep only recent history
+        if len(self.prediction_history) > self.smoothing_window:
+            self.prediction_history = self.prediction_history[-self.smoothing_window:]
+
+        # Count emotions in history
+        emotion_counts = {}
+        emotion_confidences = {}
+        for pred in self.prediction_history:
+            em = pred['emotion']
+            emotion_counts[em] = emotion_counts.get(em, 0) + 1
+            if em not in emotion_confidences:
+                emotion_confidences[em] = []
+            emotion_confidences[em].append(pred['confidence'])
+
+        # Find most common emotion
+        most_common = max(emotion_counts, key=emotion_counts.get)
+        most_common_count = emotion_counts[most_common]
+
+        # Hysteresis: only change if new emotion appears enough times
+        if most_common != self.current_smoothed_emotion:
+            if most_common_count >= self.emotion_change_threshold:
+                self.current_smoothed_emotion = most_common
+
+        # Average confidence for the smoothed emotion
+        if self.current_smoothed_emotion in emotion_confidences:
+            avg_confidence = sum(emotion_confidences[self.current_smoothed_emotion]) / len(emotion_confidences[self.current_smoothed_emotion])
+        else:
+            avg_confidence = calibrated.get('confidence', 0.0)
+
+        # Get source from most recent prediction with this emotion
+        source = 'unknown'
+        for pred in reversed(self.prediction_history):
+            if pred['emotion'] == self.current_smoothed_emotion:
+                source = pred['emotion_source']
+                break
+
+        return {
+            'emotion': self.current_smoothed_emotion,
+            'confidence': avg_confidence,
+            'emotion_source': source,
+            'raw_emotion': calibrated.get('emotion', 'Neutral'),  # Original unsmoothed
+            'history_size': len(self.prediction_history)
+        }
+
+    # ========================================================================
     # Main Loop
     # ========================================================================
 
-    def update_comparison_display(self, raw: Dict, calibrated: Dict):
+    def update_comparison_display(self, raw: Dict, calibrated: Dict, smoothed: Dict = None):
         """Update the side-by-side comparison."""
         self.raw_emotion_label.config(text=raw['emotion'])
         self.raw_confidence_label.config(text=f"Confidence: {raw['confidence']:.0%}")
 
         if calibrated.get('calibrated', False):
-            self.cal_emotion_label.config(text=calibrated['emotion'])
+            # Use smoothed prediction if available, otherwise use raw calibrated
+            display = smoothed if smoothed else calibrated
 
-            source = calibrated.get('emotion_source', 'unknown')
+            self.cal_emotion_label.config(text=display['emotion'])
+
+            source = display.get('emotion_source', 'unknown')
             source_labels = {
                 'calibration': '[CAL]',
                 'raw_model': '[RAW]'
             }
             source_label = source_labels.get(source, '[?]')
+
+            # Show if smoothed
+            smooth_indicator = " ~" if smoothed else ""
             self.cal_confidence_label.config(
-                text=f"Confidence: {calibrated['confidence']:.0%} {source_label}"
+                text=f"Confidence: {display['confidence']:.0%} {source_label}{smooth_indicator}"
             )
 
             sims = calibrated['similarities']
@@ -720,8 +793,11 @@ class AudioCalibrationDemoApp:
                     raw = self.detector.get_raw_prediction(result)
                     calibrated = self.detector.get_calibrated_prediction(result)
 
+                    # Apply smoothing to reduce prediction jumping
+                    smoothed = self.get_smoothed_prediction(calibrated)
+
                     # Update UI
-                    self.root.after(0, lambda r=raw, c=calibrated: self.update_comparison_display(r, c))
+                    self.root.after(0, lambda r=raw, c=calibrated, s=smoothed: self.update_comparison_display(r, c, s))
                     self.root.after(0, lambda: self.metrics_label.config(
                         text=f"Latency: {self.inference_time*1000:.0f} ms"
                     ))
