@@ -682,7 +682,19 @@ class CalibrationDemoApp:
         # Calibrated output
         if calibrated.get('calibrated', False):
             self.cal_emotion_label.config(text=calibrated['emotion'])
-            self.cal_confidence_label.config(text=f"Confidence: {calibrated['confidence']:.0%}")
+
+            # Show confidence and source
+            source = calibrated.get('emotion_source', 'unknown')
+            source_labels = {
+                'calibration': '[CAL]',
+                'va_shift': '[V-A]',
+                'raw_model': '[RAW]'
+            }
+            source_label = source_labels.get(source, '[?]')
+            self.cal_confidence_label.config(
+                text=f"Confidence: {calibrated['confidence']:.0%} {source_label}"
+            )
+
             self.cal_va_label.config(
                 text=f"V-shift: {calibrated['valence_shift']:+.2f} | A-shift: {calibrated['arousal_shift']:+.2f}"
             )
