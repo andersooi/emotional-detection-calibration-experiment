@@ -176,7 +176,7 @@ class FusionDemoApp:
     def __init__(self, camera_index: int = 0):
         # Models
         self.face_extractor = HSEmotionExtractor()
-        self.audio_extractor = Emotion2VecExtractor()
+        self.audio_extractor = Emotion2VecExtractor(model_size='large')
         self.face_detector = FaceDetector()
         self.audio_capture = AudioCapture()
 

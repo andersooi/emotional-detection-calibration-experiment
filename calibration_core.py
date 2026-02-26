@@ -283,35 +283,45 @@ class CalibratedDetector:
         calibrated_quadrant = self._va_to_quadrant(valence_shift, arousal_shift)
 
         # Determine calibrated emotion using hybrid approach:
-        # 1. High similarity to calibrated baseline → Use calibration
-        # 2. Low similarity to all baselines → Fall back to raw model
+        # 1. If raw model confidently detects a non-calibrated emotion → trust raw
+        # 2. High similarity to calibrated baseline → Use calibration
+        # 3. Low similarity to all baselines → Fall back to raw model
 
         raw_emotion = extraction_result['top_emotion']
         raw_confidence = extraction_result['confidence']
 
-        # Thresholds: lower = more sensitive to calibration, higher = more strict
-        HAPPY_CALM_THRESHOLD = 0.80
-        NEUTRAL_THRESHOLD = 0.85
+        # Calibrated states we have baselines for
+        CALIBRATED_EMOTIONS = {'Happiness', 'Neutral', 'Calm'}
+        RAW_OVERRIDE_CONFIDENCE = 0.60
 
-        if closest_state == 'happy' and closest_similarity > HAPPY_CALM_THRESHOLD:
-            calibrated_emotion = 'Happy'
-            emotion_source = 'calibration'
-        elif closest_state == 'calm' and closest_similarity > HAPPY_CALM_THRESHOLD:
-            calibrated_emotion = 'Calm'
-            emotion_source = 'calibration'
-        elif closest_state == 'neutral' and closest_similarity > NEUTRAL_THRESHOLD:
-            calibrated_emotion = 'Neutral'
-            emotion_source = 'calibration'
+        if raw_emotion not in CALIBRATED_EMOTIONS and raw_confidence > RAW_OVERRIDE_CONFIDENCE:
+            # Raw model is confident about an emotion we didn't calibrate for
+            # (e.g., Anger, Sadness, Fear, Surprise) — trust it
+            calibrated_emotion = raw_emotion
+            emotion_source = 'raw_model'
         else:
-            # Low similarity to all calibrated baselines
-            # Check if V-A shift strongly indicates Q3 (sad) - special case since we want to catch subtle sadness
-            if calibrated_quadrant == 'Q3' and valence_shift < -0.15:
-                calibrated_emotion = 'Sad'
-                emotion_source = 'va_shift'
+            # Apply calibration for emotions we have baselines for
+            HAPPY_CALM_THRESHOLD = 0.80
+            NEUTRAL_THRESHOLD = 0.85
+
+            if closest_state == 'happy' and closest_similarity > HAPPY_CALM_THRESHOLD:
+                calibrated_emotion = 'Happy'
+                emotion_source = 'calibration'
+            elif closest_state == 'calm' and closest_similarity > HAPPY_CALM_THRESHOLD:
+                calibrated_emotion = 'Calm'
+                emotion_source = 'calibration'
+            elif closest_state == 'neutral' and closest_similarity > NEUTRAL_THRESHOLD:
+                calibrated_emotion = 'Neutral'
+                emotion_source = 'calibration'
             else:
-                # Fall back to raw model's prediction (preserves Surprise, Anger, Fear, etc.)
-                calibrated_emotion = raw_emotion
-                emotion_source = 'raw_model'
+                # Low similarity + not confidently non-calibrated
+                # Check V-A shift for subtle sadness detection
+                if calibrated_quadrant == 'Q3' and valence_shift < -0.15:
+                    calibrated_emotion = 'Sad'
+                    emotion_source = 'va_shift'
+                else:
+                    calibrated_emotion = raw_emotion
+                    emotion_source = 'raw_model'
 
         # Compute calibrated confidence based on source
         if emotion_source == 'calibration':

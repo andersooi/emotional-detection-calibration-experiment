@@ -164,6 +164,30 @@ class FusionResult:
     modalities_present: str  # 'both', 'face_only', 'audio_only', 'none'
 
 
+def compute_modality_weights(
+    face_emotion: Optional[str], face_conf: float,
+    audio_emotion: Optional[str], audio_conf: float
+) -> tuple:
+    """
+    Signal-based modality weighting.
+
+    Key insight: When audio says Neutral, it's usually "I don't know" rather than
+    "person is neutral." So we downweight it. But when audio detects a non-neutral
+    emotion, it might be catching something face is missing (e.g., smiling outside
+    but voice is pained), so we give it real weight.
+    """
+    if audio_emotion is None or audio_emotion == 'Neutral':
+        # Audio has no signal — lean heavily on face
+        return 0.85, 0.15
+    elif face_emotion is not None and audio_emotion == FACE_TO_SHARED.get(face_emotion, face_emotion):
+        # Both agree on the same emotion — equal trust
+        return 0.50, 0.50
+    else:
+        # They disagree, and audio has a non-neutral signal
+        # Audio might be catching masked emotion — give it meaningful weight
+        return 0.55, 0.45
+
+
 def _default_result(fusion_version: int) -> FusionResult:
     """Return a default Neutral result when no modalities are present."""
     return FusionResult(
@@ -220,16 +244,14 @@ class ProbabilityFusion:
                 modalities_present='audio_only'
             )
 
-        # Both present: confidence-weighted fusion
+        # Both present: signal-based weighted fusion
         face_conf = face_result['confidence']
         audio_conf = audio_result['confidence']
-        total_conf = face_conf + audio_conf
 
-        if total_conf == 0:
-            fw, aw = 0.5, 0.5
-        else:
-            fw = face_conf / total_conf
-            aw = audio_conf / total_conf
+        fw, aw = compute_modality_weights(
+            face_result['top_emotion'], face_conf,
+            audio_result['top_emotion'], audio_conf
+        )
 
         face_aligned = align_face_probs(face_result['emotion_probs'])
         audio_aligned = align_audio_probs(audio_result['emotion_probs'])
@@ -338,16 +360,14 @@ class VAFusion:
                 modalities_present='audio_only'
             )
 
-        # Both present: confidence-weighted V-A fusion
+        # Both present: signal-based weighted V-A fusion
         face_conf = face_result['confidence']
         audio_conf = audio_result['confidence']
-        total_conf = face_conf + audio_conf
 
-        if total_conf == 0:
-            fw, aw = 0.5, 0.5
-        else:
-            fw = face_conf / total_conf
-            aw = audio_conf / total_conf
+        fw, aw = compute_modality_weights(
+            face_result['top_emotion'], face_conf,
+            audio_result['top_emotion'], audio_conf
+        )
 
         fv, fa = self._get_face_va(face_result)
         av, aa = audio_probs_to_va(audio_result['emotion_probs'])

@@ -178,7 +178,7 @@ class AudioCalibrationDemoApp:
 
     def __init__(self):
         # Initialize components
-        self.extractor = Emotion2VecExtractor()
+        self.extractor = Emotion2VecExtractor(model_size='large')
         self.calibration_manager = AudioCalibrationManager()
         self.detector = CalibratedAudioDetector()
         self.audio_capture = AudioCapture()

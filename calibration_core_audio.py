@@ -279,23 +279,36 @@ class CalibratedAudioDetector:
         raw_emotion = extraction_result['top_emotion']
         raw_confidence = extraction_result['confidence']
 
-        # Thresholds (same as visual for now, can tune later)
-        HAPPY_CALM_THRESHOLD = 0.80
-        NEUTRAL_THRESHOLD = 0.85
+        # Calibrated states we know about
+        CALIBRATED_EMOTIONS = {'Happy', 'Neutral', 'Calm'}
 
-        if closest_state == 'happy' and closest_similarity > HAPPY_CALM_THRESHOLD:
-            calibrated_emotion = 'Happy'
-            emotion_source = 'calibration'
-        elif closest_state == 'calm' and closest_similarity > HAPPY_CALM_THRESHOLD:
-            calibrated_emotion = 'Calm'
-            emotion_source = 'calibration'
-        elif closest_state == 'neutral' and closest_similarity > NEUTRAL_THRESHOLD:
-            calibrated_emotion = 'Neutral'
-            emotion_source = 'calibration'
-        else:
-            # Fall back to raw model's prediction
+        # Key rule: If raw model confidently detects a NON-calibrated emotion
+        # (e.g., Sad, Angry, Fear), trust the raw model — calibration has no
+        # reference for these states and could misclassify them.
+        RAW_OVERRIDE_CONFIDENCE = 0.60
+
+        if raw_emotion not in CALIBRATED_EMOTIONS and raw_confidence > RAW_OVERRIDE_CONFIDENCE:
+            # Raw model is confident about an emotion we didn't calibrate for
             calibrated_emotion = raw_emotion
             emotion_source = 'raw_model'
+        else:
+            # Apply calibration for emotions we have baselines for
+            HAPPY_CALM_THRESHOLD = 0.80
+            NEUTRAL_THRESHOLD = 0.85
+
+            if closest_state == 'happy' and closest_similarity > HAPPY_CALM_THRESHOLD:
+                calibrated_emotion = 'Happy'
+                emotion_source = 'calibration'
+            elif closest_state == 'calm' and closest_similarity > HAPPY_CALM_THRESHOLD:
+                calibrated_emotion = 'Calm'
+                emotion_source = 'calibration'
+            elif closest_state == 'neutral' and closest_similarity > NEUTRAL_THRESHOLD:
+                calibrated_emotion = 'Neutral'
+                emotion_source = 'calibration'
+            else:
+                # Fall back to raw model's prediction
+                calibrated_emotion = raw_emotion
+                emotion_source = 'raw_model'
 
         # Compute calibrated confidence
         if emotion_source == 'calibration':
