@@ -195,8 +195,12 @@ class FusionDemoApp:
 
         # Thread-safe latest results
         self._lock = threading.Lock()
-        self._latest_face_result: Optional[Dict] = None
-        self._latest_audio_result: Optional[Dict] = None
+        self._latest_face_result: Optional[Dict] = None     # Raw extractor output
+        self._latest_face_raw: Optional[Dict] = None        # Raw prediction (formatted)
+        self._latest_face_cal: Optional[Dict] = None        # Calibrated prediction
+        self._latest_audio_result: Optional[Dict] = None    # Raw extractor output
+        self._latest_audio_raw: Optional[Dict] = None       # Raw prediction (formatted)
+        self._latest_audio_cal: Optional[Dict] = None       # Calibrated prediction
         self._face_timestamp: float = 0.0
         self._audio_timestamp: float = 0.0
         self._latest_frame: Optional[np.ndarray] = None
@@ -226,7 +230,7 @@ class FusionDemoApp:
         # GUI
         self.root = tk.Tk()
         self.root.title("AIRA Multimodal Fusion Demo")
-        self.root.geometry("1300x700")
+        self.root.geometry("1500x700")
         self.root.configure(bg=COLORS['bg_dark'])
         self._setup_ui()
 
@@ -292,12 +296,14 @@ class FusionDemoApp:
         self.progress_bar.pack_forget()
 
     def _create_right_panel(self, parent):
-        # Three-column comparison
+        # Five-column comparison: Face Raw | Face Cal | Audio Raw | Audio Cal | Fused
         cols = tk.Frame(parent, bg=COLORS['bg_medium'])
         cols.pack(fill='both', expand=True)
 
-        self.face_widgets = self._create_prediction_column(cols, "FACE ONLY", COLORS['accent_blue'])
-        self.audio_widgets = self._create_prediction_column(cols, "AUDIO ONLY", COLORS['accent_purple'])
+        self.face_raw_widgets = self._create_prediction_column(cols, "FACE RAW", COLORS['accent_red'])
+        self.face_cal_widgets = self._create_prediction_column(cols, "FACE CAL", COLORS['accent_blue'])
+        self.audio_raw_widgets = self._create_prediction_column(cols, "AUDIO RAW", COLORS['accent_red'])
+        self.audio_cal_widgets = self._create_prediction_column(cols, "AUDIO CAL", COLORS['accent_purple'])
         self.fused_widgets = self._create_prediction_column(cols, "FUSED", COLORS['accent_green'])
 
         # Fusion settings
@@ -324,27 +330,27 @@ class FusionDemoApp:
         self.weights_label.pack(side='right')
 
     def _create_prediction_column(self, parent, title: str, color: str) -> Dict:
-        frame = tk.Frame(parent, bg=COLORS['bg_dark'], padx=8, pady=8)
-        frame.pack(side='left', fill='both', expand=True, padx=3)
+        frame = tk.Frame(parent, bg=COLORS['bg_dark'], padx=6, pady=6)
+        frame.pack(side='left', fill='both', expand=True, padx=2)
 
-        tk.Label(frame, text=title, font=('Helvetica', 10, 'bold'),
+        tk.Label(frame, text=title, font=('Helvetica', 9, 'bold'),
                  bg=COLORS['bg_dark'], fg=color).pack()
 
-        emotion = tk.Label(frame, text="--", font=('Helvetica', 16, 'bold'),
+        emotion = tk.Label(frame, text="--", font=('Helvetica', 13, 'bold'),
                            bg=COLORS['bg_dark'], fg=COLORS['text_white'])
-        emotion.pack(pady=8)
+        emotion.pack(pady=5)
 
-        confidence = tk.Label(frame, text="Conf: --", font=('Helvetica', 9),
+        confidence = tk.Label(frame, text="Conf: --", font=('Helvetica', 8),
                               bg=COLORS['bg_dark'], fg=COLORS['text_gray'])
         confidence.pack()
 
-        va = tk.Label(frame, text="V: -- A: --", font=('Helvetica', 9),
+        va = tk.Label(frame, text="V: -- A: --", font=('Helvetica', 8),
                       bg=COLORS['bg_dark'], fg=COLORS['text_gray'])
         va.pack()
 
-        quadrant = tk.Label(frame, text="Q: --", font=('Helvetica', 9),
+        quadrant = tk.Label(frame, text="Q: --", font=('Helvetica', 8),
                             bg=COLORS['bg_dark'], fg=COLORS['text_gray'])
-        quadrant.pack(pady=(3, 0))
+        quadrant.pack(pady=(2, 0))
 
         return {'emotion': emotion, 'confidence': confidence, 'va': va, 'quadrant': quadrant}
 
@@ -609,7 +615,11 @@ class FusionDemoApp:
         # Read latest results (thread-safe)
         with self._lock:
             face_result = self._latest_face_result.copy() if self._latest_face_result else None
+            face_raw = self._latest_face_raw.copy() if self._latest_face_raw else None
+            face_cal = self._latest_face_cal.copy() if self._latest_face_cal else None
             audio_result = self._latest_audio_result.copy() if self._latest_audio_result else None
+            audio_raw = self._latest_audio_raw.copy() if self._latest_audio_raw else None
+            audio_cal = self._latest_audio_cal.copy() if self._latest_audio_cal else None
             face_age = time.time() - self._face_timestamp
             audio_age = time.time() - self._audio_timestamp
             frame = self._latest_frame.copy() if self._latest_frame is not None else None
@@ -618,36 +628,71 @@ class FusionDemoApp:
         # Staleness check
         if face_result is not None and face_age > 1.0:
             face_result = None
+            face_raw = None
+            face_cal = None
         if audio_result is not None and audio_age > AUDIO_STALE_THRESHOLD:
             audio_result = None
+            audio_raw = None
+            audio_cal = None
 
         # Update video
         if frame is not None:
             self.root.after(0, lambda f=frame, b=bbox: self.update_video(f, b))
 
-        # Update face column
-        if face_result:
+        # Update face raw column
+        if face_raw:
             self._update_column(
-                self.face_widgets,
-                face_result['top_emotion'],
-                face_result['confidence'],
-                face_result.get('valence'), face_result.get('arousal'),
-                quadrant=QUADRANT_LABELS.get(
-                    self._va_to_q(face_result.get('valence', 0), face_result.get('arousal', 0)), '--')
+                self.face_raw_widgets,
+                face_raw['emotion'],
+                face_raw['confidence'],
+                face_raw.get('valence'), face_raw.get('arousal'),
+                quadrant=face_raw.get('quadrant_label', '--')
             )
         else:
-            self._update_column(self.face_widgets, "NO FACE", 0)
+            self._update_column(self.face_raw_widgets, "NO FACE", 0)
 
-        # Update audio column
-        if audio_result:
+        # Update face calibrated column
+        if face_cal and face_cal.get('calibrated'):
+            source = face_cal.get('emotion_source', '')
+            tag = {'calibration': '[CAL]', 'va_shift': '[V-A]', 'raw_model': '[RAW]'}.get(source, '')
             self._update_column(
-                self.audio_widgets,
-                audio_result['top_emotion'],
-                audio_result['confidence'],
+                self.face_cal_widgets,
+                face_cal['emotion'],
+                face_cal['confidence'],
+                quadrant=face_cal.get('quadrant_label', '--'),
+                tag=tag
+            )
+        elif face_raw:
+            self._update_column(self.face_cal_widgets, "No Cal", 0, tag="calibrate first")
+        else:
+            self._update_column(self.face_cal_widgets, "NO FACE", 0)
+
+        # Update audio raw column
+        if audio_raw:
+            self._update_column(
+                self.audio_raw_widgets,
+                audio_raw['emotion'],
+                audio_raw['confidence'],
                 quadrant='--'
             )
         else:
-            self._update_column(self.audio_widgets, "NO AUDIO", 0)
+            self._update_column(self.audio_raw_widgets, "NO AUDIO", 0)
+
+        # Update audio calibrated column
+        if audio_cal and audio_cal.get('calibrated'):
+            source = audio_cal.get('emotion_source', '')
+            tag = {'calibration': '[CAL]', 'raw_model': '[RAW]'}.get(source, '')
+            self._update_column(
+                self.audio_cal_widgets,
+                audio_cal['emotion'],
+                audio_cal['confidence'],
+                quadrant='--',
+                tag=tag
+            )
+        elif audio_raw:
+            self._update_column(self.audio_cal_widgets, "No Cal", 0, tag="calibrate first")
+        else:
+            self._update_column(self.audio_cal_widgets, "NO AUDIO", 0)
 
         # Fuse and update fused column
         fusion_result = self.fusion.fuse(face_result, audio_result)
@@ -715,8 +760,14 @@ class FusionDemoApp:
                     result = self.face_extractor.extract(face_img)
                     self.face_latency = time.time() - start
 
+                    # Compute raw and calibrated predictions
+                    raw_pred = self.face_cal_detector.get_raw_prediction(result)
+                    cal_pred = self.face_cal_detector.get_calibrated_prediction(result)
+
                     with self._lock:
                         self._latest_face_result = result
+                        self._latest_face_raw = raw_pred
+                        self._latest_face_cal = cal_pred
                         self._face_timestamp = time.time()
 
                     # Capture for calibration if active
@@ -725,6 +776,8 @@ class FusionDemoApp:
                 else:
                     with self._lock:
                         self._latest_face_result = None
+                        self._latest_face_raw = None
+                        self._latest_face_cal = None
 
                 time.sleep(0.01)
             except Exception as e:
@@ -754,8 +807,14 @@ class FusionDemoApp:
                     result = self.audio_extractor.extract(chunk, SAMPLE_RATE)
                     self.audio_latency = time.time() - start
 
+                    # Compute raw and calibrated predictions
+                    raw_pred = self.audio_cal_detector.get_raw_prediction(result)
+                    cal_pred = self.audio_cal_detector.get_calibrated_prediction(result)
+
                     with self._lock:
                         self._latest_audio_result = result
+                        self._latest_audio_raw = raw_pred
+                        self._latest_audio_cal = cal_pred
                         self._audio_timestamp = time.time()
                 else:
                     time.sleep(0.05)
