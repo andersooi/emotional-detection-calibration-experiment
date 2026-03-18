@@ -15,3 +15,9 @@ user_profiles/*.pkl
 # IDE
 .idea/
 .vscode/
+
+# MediaPipe model file
+face_landmarker.task
+
+# Presentation files
+*.html
