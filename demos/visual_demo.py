@@ -1,74 +1,65 @@
 """
-Emotion2Vec Audio Calibration Test Demo
+HSEmotion Calibration Test Demo
 
-Shows raw model output vs calibrated output side-by-side for audio.
+Shows raw model output vs calibrated output side-by-side.
 
 Usage:
-    python calibration_demo_audio.py
+    python calibration_demo.py              # Use default camera (index 0)
+    python calibration_demo.py --camera 1   # Use MacBook webcam (index 1)
 """
 
 import time
 import threading
-import queue
 import numpy as np
+import cv2
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
+from PIL import Image, ImageTk
 from typing import Optional, List, Dict
 
-from calibration_core_audio import (
-    AudioUserBaseline,
-    Emotion2VecExtractor,
-    AudioCalibrationManager,
-    CalibratedAudioDetector,
-    average_embeddings
+from core import (
+    UserBaseline,
+    HSEmotionExtractor,
+    CalibrationManager,
+    CalibratedDetector,
+    average_embeddings,
+    average_values
 )
-
-# Try to import audio libraries
-try:
-    import sounddevice as sd
-    AUDIO_BACKEND = 'sounddevice'
-except ImportError:
-    sd = None
-    AUDIO_BACKEND = None
 
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
-# Audio settings
-SAMPLE_RATE = 16000  # Emotion2Vec expects 16kHz
-CHUNK_DURATION = 3.0  # Process 3 seconds at a time
-CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)
-
 # Calibration states to capture
 CALIBRATION_STATES = [
     {
         'name': 'neutral',
         'label': 'Neutral',
-        'instruction': 'Please count from 1 to 10 in your normal, relaxed voice.\n'
-                      'Speak naturally as if talking to a friend.',
-        'duration': 8
+        'instruction': 'Please look at the camera with a relaxed, natural expression.\n'
+                      'Just be comfortable - no need to smile or frown.',
+        'duration': 5
     },
     {
         'name': 'happy',
         'label': 'Happy',
-        'instruction': 'Tell me about something that makes you happy!\n'
-                      'It could be a hobby, a pet, or a fond memory.\n'
-                      'Let your joy come through in your voice.',
-        'duration': 10
+        'instruction': 'Think of a happy memory - perhaps a time with family or friends.\n'
+                      'Let yourself smile naturally.',
+        'duration': 5
     },
     {
         'name': 'calm',
         'label': 'Calm',
-        'instruction': 'Take a deep breath and speak slowly.\n'
-                      'Say: "I feel calm, relaxed, and at peace."\n'
-                      'Repeat it a few times in a soothing tone.',
-        'duration': 10
+        'instruction': 'Take a slow, deep breath. Feel relaxed and peaceful.\n'
+                      'This is your calm, content state.',
+        'duration': 5
     }
 ]
 
-# Colors (same as visual demo)
+# How many frames to average for baseline (last 3-4 seconds at ~10fps)
+FRAMES_TO_AVERAGE = 25
+
+# Colors
 COLORS = {
     'bg_dark': '#2C3E50',
     'bg_medium': '#34495E',
@@ -78,133 +69,98 @@ COLORS = {
     'accent_red': '#E74C3C',
     'accent_blue': '#3498DB',
     'accent_yellow': '#F1C40F',
+    'neutral': '#95A5A6',
+    'happy': '#2ECC71',
+    'calm': '#3498DB',
+    'sad': '#9B59B6',
+    'stressed': '#E74C3C'
 }
 
 
 # ============================================================================
-# Audio Capture
+# Face Detector (OpenCV Haar Cascade)
 # ============================================================================
 
-class AudioCapture:
-    """Continuous audio capture from microphone."""
+class FaceDetector:
+    """Simple face detection using OpenCV."""
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, chunk_duration: float = CHUNK_DURATION):
-        self.sample_rate = sample_rate
-        self.chunk_duration = chunk_duration
-        self.chunk_samples = int(sample_rate * chunk_duration)
+    def __init__(self):
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        self.cascade = cv2.CascadeClassifier(cascade_path)
 
-        self.running = False
-        self.audio_queue = queue.Queue()
-        self.buffer = np.array([], dtype=np.float32)
-        self.stream = None
+    def detect(self, frame: np.ndarray) -> Optional[tuple]:
+        """
+        Detect face in frame.
 
-    def _audio_callback(self, indata, frames, time_info, status):
-        """Callback for sounddevice stream."""
-        if status:
-            print(f"Audio status: {status}")
-
-        # Add to buffer
-        audio_chunk = indata[:, 0].copy()  # Mono
-        self.buffer = np.concatenate([self.buffer, audio_chunk])
-
-        # Debug: print buffer size occasionally
-        if len(self.buffer) % 16000 < 1600:  # Every ~1 second
-            print(f"  Audio buffer: {len(self.buffer)} samples, max={np.abs(audio_chunk).max():.3f}")
-
-        # If buffer has enough samples, put in queue
-        while len(self.buffer) >= self.chunk_samples:
-            chunk = self.buffer[:self.chunk_samples]
-            self.buffer = self.buffer[self.chunk_samples // 2:]  # 50% overlap
-            self.audio_queue.put(chunk)
-
-    def start(self):
-        """Start audio capture."""
-        if sd is None:
-            raise RuntimeError("sounddevice not installed. Run: pip install sounddevice")
-
-        self.running = True
-        self.buffer = np.array([], dtype=np.float32)
-
-        # Show available devices
-        print(f"Default input device: {sd.default.device[0]}")
-        print(f"Starting audio stream at {self.sample_rate}Hz...")
-
-        self.stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype=np.float32,
-            callback=self._audio_callback,
-            blocksize=int(self.sample_rate * 0.1)  # 100ms blocks
+        Returns:
+            (face_rgb, bbox) or (None, None) if no face found
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(60, 60)
         )
-        self.stream.start()
-        print("Audio stream started!")
 
-    def stop(self):
-        """Stop audio capture."""
-        self.running = False
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        if len(faces) == 0:
+            return None, None
 
-    def get_chunk(self, timeout: float = 0.1) -> Optional[np.ndarray]:
-        """Get next audio chunk from queue."""
-        try:
-            return self.audio_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        # Get largest face
+        areas = [w * h for (x, y, w, h) in faces]
+        idx = np.argmax(areas)
+        x, y, w, h = faces[idx]
 
-    def get_current_buffer(self) -> np.ndarray:
-        """Get current audio buffer (for calibration capture)."""
-        return self.buffer.copy()
+        # Add margin
+        margin = int(0.1 * w)
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(frame.shape[1], x + w + margin)
+        y2 = min(frame.shape[0], y + h + margin)
 
-    def clear_buffer(self):
-        """Clear the audio buffer."""
-        self.buffer = np.array([], dtype=np.float32)
-        # Clear queue too
-        while not self.audio_queue.empty():
-            try:
-                self.audio_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Crop and convert to RGB
+        face_img = frame[y1:y2, x1:x2]
+        face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+
+        return face_rgb, (x1, y1, x2, y2)
 
 
 # ============================================================================
 # Main Application
 # ============================================================================
 
-class AudioCalibrationDemoApp:
-    """Main GUI application for audio calibration testing."""
+class CalibrationDemoApp:
+    """Main GUI application for calibration testing."""
 
-    def __init__(self):
+    def __init__(self, camera_index: int = 0):
         # Initialize components
-        self.extractor = Emotion2VecExtractor(model_size='large')
-        self.calibration_manager = AudioCalibrationManager()
-        self.detector = CalibratedAudioDetector()
-        self.audio_capture = AudioCapture()
+        self.extractor = HSEmotionExtractor()
+        self.face_detector = FaceDetector()
+        self.calibration_manager = CalibrationManager()
+        self.detector = CalibratedDetector()
+
+        # Camera
+        self.camera_index = camera_index
 
         # State
+        self.cap: Optional[cv2.VideoCapture] = None
         self.running = False
         self.current_user: Optional[str] = None
         self.calibration_in_progress = False
         self.calibration_state_idx = 0
         self.capture_start_time = 0.0
-        self.captured_audio: List[np.ndarray] = []
-
-        # Prediction smoothing (to reduce jumping between emotions)
-        self.prediction_history: List[Dict] = []
-        self.smoothing_window = 3  # Number of predictions to average
-        self.current_smoothed_emotion = "Neutral"
-        self.emotion_change_threshold = 2  # Need N consecutive different predictions to change
+        self.captured_frames: List[Dict] = []
 
         # Metrics
         self.inference_time = 0.0
-        self.chunks_processed = 0
+        self.fps = 0.0
+        self.frame_count = 0
+        self.fps_start_time = time.time()
 
         # Setup GUI
         self.root = tk.Tk()
-        self.root.title("AIRA Audio Calibration Test - Raw vs Calibrated")
-        self.root.geometry("900x600")
+        self.root.title("AIRA Calibration Test - Raw vs Calibrated")
+        self.root.geometry("1100x700")
         self.root.configure(bg=COLORS['bg_dark'])
 
         self._setup_ui()
@@ -222,11 +178,11 @@ class AudioCalibrationDemoApp:
         content_frame = tk.Frame(main_frame, bg=COLORS['bg_dark'])
         content_frame.pack(fill='both', expand=True, pady=10)
 
-        # Left panel - Audio visualization / Status
+        # Left panel - Camera
         left_panel = tk.Frame(content_frame, bg=COLORS['bg_dark'])
         left_panel.pack(side='left', fill='both', expand=True)
 
-        self._create_audio_panel(left_panel)
+        self._create_camera_panel(left_panel)
 
         # Right panel - Comparison
         right_panel = tk.Frame(content_frame, bg=COLORS['bg_medium'], padx=15, pady=15)
@@ -242,14 +198,16 @@ class AudioCalibrationDemoApp:
         top_bar = tk.Frame(parent, bg=COLORS['bg_dark'])
         top_bar.pack(fill='x', pady=(0, 10))
 
+        # Title
         tk.Label(
             top_bar,
-            text="AIRA Audio Calibration Test",
+            text="AIRA Calibration Test",
             font=('Helvetica', 18, 'bold'),
             bg=COLORS['bg_dark'],
             fg=COLORS['text_white']
         ).pack(side='left')
 
+        # User label
         self.user_label = tk.Label(
             top_bar,
             text="[No User]",
@@ -259,41 +217,23 @@ class AudioCalibrationDemoApp:
         )
         self.user_label.pack(side='right')
 
-    def _create_audio_panel(self, parent):
-        """Create audio status and visualization panel."""
+    def _create_camera_panel(self, parent):
+        """Create camera display and status."""
+        # Video label
+        self.video_label = tk.Label(parent, bg='#1a1a2e')
+        self.video_label.pack(pady=10)
+
         # Status label
         self.status_label = tk.Label(
             parent,
             text="Initializing...",
-            font=('Helvetica', 14),
+            font=('Helvetica', 11),
             bg=COLORS['bg_dark'],
             fg=COLORS['text_gray']
         )
-        self.status_label.pack(pady=20)
+        self.status_label.pack(pady=5)
 
-        # Audio level indicator (simple bar)
-        level_frame = tk.Frame(parent, bg=COLORS['bg_dark'])
-        level_frame.pack(pady=10)
-
-        tk.Label(
-            level_frame,
-            text="Audio Level:",
-            font=('Helvetica', 10),
-            bg=COLORS['bg_dark'],
-            fg=COLORS['text_gray']
-        ).pack(side='left', padx=5)
-
-        self.level_canvas = tk.Canvas(
-            level_frame,
-            width=200,
-            height=20,
-            bg=COLORS['bg_medium'],
-            highlightthickness=1,
-            highlightbackground='#7F8C8D'
-        )
-        self.level_canvas.pack(side='left', padx=5)
-
-        # Instruction label (for calibration)
+        # Calibration instruction (shown during calibration)
         self.instruction_label = tk.Label(
             parent,
             text="",
@@ -303,9 +243,9 @@ class AudioCalibrationDemoApp:
             wraplength=400,
             justify='center'
         )
-        self.instruction_label.pack(pady=20)
+        self.instruction_label.pack(pady=5)
 
-        # Progress bar (for calibration)
+        # Calibration progress bar
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
             parent,
@@ -314,10 +254,11 @@ class AudioCalibrationDemoApp:
             variable=self.progress_var
         )
         self.progress_bar.pack(pady=5)
-        self.progress_bar.pack_forget()
+        self.progress_bar.pack_forget()  # Hide initially
 
     def _create_comparison_panel(self, parent):
         """Create side-by-side comparison display."""
+        # Header
         tk.Label(
             parent,
             text="Prediction Comparison",
@@ -326,6 +267,7 @@ class AudioCalibrationDemoApp:
             fg=COLORS['text_white']
         ).pack(pady=(0, 15))
 
+        # Comparison container
         comparison_frame = tk.Frame(parent, bg=COLORS['bg_medium'])
         comparison_frame.pack(fill='both', expand=True)
 
@@ -359,6 +301,32 @@ class AudioCalibrationDemoApp:
         )
         self.raw_confidence_label.pack()
 
+        tk.Label(
+            raw_frame,
+            text="────────────",
+            font=('Helvetica', 10),
+            bg=COLORS['bg_dark'],
+            fg=COLORS['text_gray']
+        ).pack(pady=5)
+
+        self.raw_va_label = tk.Label(
+            raw_frame,
+            text="V: -- | A: --",
+            font=('Helvetica', 10),
+            bg=COLORS['bg_dark'],
+            fg=COLORS['text_gray']
+        )
+        self.raw_va_label.pack()
+
+        self.raw_quadrant_label = tk.Label(
+            raw_frame,
+            text="Quadrant: --",
+            font=('Helvetica', 10),
+            bg=COLORS['bg_dark'],
+            fg=COLORS['text_gray']
+        )
+        self.raw_quadrant_label.pack(pady=5)
+
         # --- Calibrated Output Column ---
         cal_frame = tk.Frame(comparison_frame, bg=COLORS['bg_dark'], padx=10, pady=10)
         cal_frame.pack(side='right', fill='both', expand=True, padx=(5, 0))
@@ -389,6 +357,32 @@ class AudioCalibrationDemoApp:
         )
         self.cal_confidence_label.pack()
 
+        tk.Label(
+            cal_frame,
+            text="────────────",
+            font=('Helvetica', 10),
+            bg=COLORS['bg_dark'],
+            fg=COLORS['text_gray']
+        ).pack(pady=5)
+
+        self.cal_va_label = tk.Label(
+            cal_frame,
+            text="V-shift: -- | A-shift: --",
+            font=('Helvetica', 10),
+            bg=COLORS['bg_dark'],
+            fg=COLORS['text_gray']
+        )
+        self.cal_va_label.pack()
+
+        self.cal_quadrant_label = tk.Label(
+            cal_frame,
+            text="Quadrant: --",
+            font=('Helvetica', 10),
+            bg=COLORS['bg_dark'],
+            fg=COLORS['text_gray']
+        )
+        self.cal_quadrant_label.pack(pady=5)
+
         # --- Similarities Section ---
         sim_frame = tk.Frame(parent, bg=COLORS['bg_medium'])
         sim_frame.pack(fill='x', pady=(15, 0))
@@ -415,6 +409,7 @@ class AudioCalibrationDemoApp:
         bottom_bar = tk.Frame(parent, bg=COLORS['bg_dark'])
         bottom_bar.pack(fill='x', pady=(10, 0))
 
+        # Buttons
         btn_frame = tk.Frame(bottom_bar, bg=COLORS['bg_dark'])
         btn_frame.pack(side='left')
 
@@ -455,9 +450,10 @@ class AudioCalibrationDemoApp:
         )
         self.save_btn.pack(side='left', padx=5)
 
+        # Metrics
         self.metrics_label = tk.Label(
             bottom_bar,
-            text="Latency: -- ms",
+            text="Latency: -- ms | FPS: --",
             font=('Helvetica', 10),
             bg=COLORS['bg_dark'],
             fg=COLORS['text_gray']
@@ -465,33 +461,15 @@ class AudioCalibrationDemoApp:
         self.metrics_label.pack(side='right')
 
     # ========================================================================
-    # Audio Level Visualization
-    # ========================================================================
-
-    def update_audio_level(self, audio_chunk: np.ndarray):
-        """Update audio level indicator."""
-        if audio_chunk is None or len(audio_chunk) == 0:
-            level = 0
-        else:
-            level = np.abs(audio_chunk).mean()
-
-        # Map to bar width (0-200)
-        bar_width = min(int(level * 2000), 200)
-
-        self.level_canvas.delete("all")
-        if bar_width > 0:
-            color = COLORS['accent_green'] if bar_width < 150 else COLORS['accent_yellow']
-            self.level_canvas.create_rectangle(0, 0, bar_width, 20, fill=color, outline='')
-
-    # ========================================================================
     # Calibration Methods
     # ========================================================================
 
     def start_calibration(self):
         """Start the calibration flow."""
+        # Prompt for user ID
         user_id = simpledialog.askstring(
             "User ID",
-            "Enter a user ID for this audio calibration:",
+            "Enter a user ID for this calibration:",
             initialvalue="test_user"
         )
 
@@ -501,16 +479,16 @@ class AudioCalibrationDemoApp:
         self.current_user = user_id
         self.user_label.config(text=f"User: {user_id}")
 
+        # Reset calibration state
         self.calibration_in_progress = True
         self.calibration_state_idx = 0
-        self.captured_audio = []
+        self.captured_frames = []
 
+        # Disable buttons during calibration
         self.calibrate_btn.config(state='disabled')
         self.load_btn.config(state='disabled')
 
-        # Clear audio buffer
-        self.audio_capture.clear_buffer()
-
+        # Start first capture
         self._start_state_capture()
 
     def _start_state_capture(self):
@@ -521,29 +499,36 @@ class AudioCalibrationDemoApp:
 
         state = CALIBRATION_STATES[self.calibration_state_idx]
 
+        # Update UI
         self.instruction_label.config(
-            text=f"🎤 Recording {state['label'].upper()}\n\n{state['instruction']}"
+            text=f"📷 Capturing {state['label'].upper()}\n\n{state['instruction']}"
         )
         self.progress_bar.pack(pady=5)
         self.progress_var.set(0)
 
-        self.captured_audio = []
+        self.captured_frames = []
         self.capture_start_time = time.time()
-        self.audio_capture.clear_buffer()
 
-        self.status_label.config(text=f"Recording: {state['label']} ({state['duration']} sec)")
+        # Status
+        self.status_label.config(text=f"Calibrating: {state['label']} ({state['duration']} sec)")
 
-    def _process_calibration_audio(self):
-        """Process audio during calibration."""
+    def _capture_frame_for_calibration(self, result: Dict):
+        """Capture a frame during calibration."""
         if not self.calibration_in_progress:
             return
 
         state = CALIBRATION_STATES[self.calibration_state_idx]
         elapsed = time.time() - self.capture_start_time
 
+        # Update progress
         progress = min(100, (elapsed / state['duration']) * 100)
         self.progress_var.set(progress)
 
+        # Skip first 1 second for user to settle
+        if elapsed > 1.0:
+            self.captured_frames.append(result)
+
+        # Check if capture complete
         if elapsed >= state['duration']:
             self._finalize_state_capture()
 
@@ -551,43 +536,49 @@ class AudioCalibrationDemoApp:
         """Finalize capture for current state and move to next."""
         state = CALIBRATION_STATES[self.calibration_state_idx]
 
-        # Get all captured audio
-        full_audio = self.audio_capture.get_current_buffer()
-
-        if len(full_audio) < SAMPLE_RATE * 2:  # At least 2 seconds
+        if len(self.captured_frames) < 5:
             messagebox.showwarning(
                 "Capture Failed",
-                f"Not enough audio captured for {state['label']}. Please try again."
+                f"Not enough frames captured for {state['label']}. Please try again."
             )
             self._start_state_capture()
             return
 
-        # Extract embedding from the full audio
-        try:
-            result = self.extractor.extract(full_audio, SAMPLE_RATE)
-            embedding = result['embedding']
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to process audio: {e}")
-            self._start_state_capture()
-            return
+        # Average the last N frames
+        frames_to_use = self.captured_frames[-FRAMES_TO_AVERAGE:] if len(self.captured_frames) >= FRAMES_TO_AVERAGE else self.captured_frames
 
-        # Store in temporary baseline
+        embeddings = [f['embedding'] for f in frames_to_use]
+        valences = [f['valence'] for f in frames_to_use]
+        arousals = [f['arousal'] for f in frames_to_use]
+
+        avg_embedding = average_embeddings(embeddings)
+        avg_valence = average_values(valences)
+        avg_arousal = average_values(arousals)
+
+        # Store in temporary baseline (create if first state)
         if self.calibration_state_idx == 0:
-            self._temp_baseline = AudioUserBaseline(user_id=self.current_user)
+            self._temp_baseline = UserBaseline(user_id=self.current_user)
 
         state_name = state['name']
         if state_name == 'neutral':
-            self._temp_baseline.neutral_embedding = embedding
+            self._temp_baseline.neutral_embedding = avg_embedding
+            self._temp_baseline.neutral_valence = avg_valence
+            self._temp_baseline.neutral_arousal = avg_arousal
         elif state_name == 'happy':
-            self._temp_baseline.happy_embedding = embedding
+            self._temp_baseline.happy_embedding = avg_embedding
+            self._temp_baseline.happy_valence = avg_valence
+            self._temp_baseline.happy_arousal = avg_arousal
         elif state_name == 'calm':
-            self._temp_baseline.calm_embedding = embedding
+            self._temp_baseline.calm_embedding = avg_embedding
+            self._temp_baseline.calm_valence = avg_valence
+            self._temp_baseline.calm_arousal = avg_arousal
 
         # Move to next state
         self.calibration_state_idx += 1
-        self.audio_capture.clear_buffer()
+        self.captured_frames = []
 
-        self.root.after(1000, self._start_state_capture)
+        # Brief pause then next
+        self.root.after(500, self._start_state_capture)
 
     def _complete_calibration(self):
         """Complete the calibration process."""
@@ -595,8 +586,10 @@ class AudioCalibrationDemoApp:
         self.progress_bar.pack_forget()
         self.instruction_label.config(text="")
 
+        # Set baseline for detector
         self.detector.set_baseline(self._temp_baseline)
 
+        # Re-enable buttons
         self.calibrate_btn.config(state='normal')
         self.load_btn.config(state='normal')
         self.save_btn.config(state='normal')
@@ -605,7 +598,7 @@ class AudioCalibrationDemoApp:
 
         messagebox.showinfo(
             "Calibration Complete",
-            f"Audio calibration complete for user '{self.current_user}'.\n\n"
+            f"Calibration complete for user '{self.current_user}'.\n\n"
             "You can now see the comparison between raw and calibrated outputs.\n"
             "Click 'Save Profile' to save this calibration."
         )
@@ -617,19 +610,20 @@ class AudioCalibrationDemoApp:
             return
 
         filepath = self.calibration_manager.save_profile(self._temp_baseline)
-        messagebox.showinfo("Profile Saved", f"Audio profile saved to:\n{filepath}")
+        messagebox.showinfo("Profile Saved", f"Profile saved to:\n{filepath}")
 
     def load_profile(self):
         """Load an existing profile."""
         profiles = self.calibration_manager.list_profiles()
 
         if not profiles:
-            messagebox.showinfo("No Profiles", "No saved audio profiles found.")
+            messagebox.showinfo("No Profiles", "No saved profiles found.")
             return
 
+        # Simple selection dialog
         user_id = simpledialog.askstring(
             "Load Profile",
-            f"Available audio profiles: {', '.join(profiles)}\n\nEnter user ID to load:"
+            f"Available profiles: {', '.join(profiles)}\n\nEnter user ID to load:"
         )
 
         if not user_id:
@@ -637,7 +631,7 @@ class AudioCalibrationDemoApp:
 
         baseline = self.calibration_manager.load_profile(user_id)
         if baseline is None:
-            messagebox.showwarning("Not Found", f"Audio profile '{user_id}' not found.")
+            messagebox.showwarning("Not Found", f"Profile '{user_id}' not found.")
             return
 
         self.current_user = user_id
@@ -645,100 +639,68 @@ class AudioCalibrationDemoApp:
         self.detector.set_baseline(baseline)
         self._temp_baseline = baseline
 
-        self.status_label.config(text=f"Loaded audio profile for '{user_id}'")
+        self.status_label.config(text=f"Loaded profile for '{user_id}'")
         self.save_btn.config(state='normal')
 
-        messagebox.showinfo("Profile Loaded", f"Audio profile '{user_id}' loaded successfully.")
-
-    # ========================================================================
-    # Prediction Smoothing
-    # ========================================================================
-
-    def get_smoothed_prediction(self, calibrated: Dict) -> Dict:
-        """
-        Smooth predictions over a window to reduce jumping.
-
-        Uses majority voting over recent predictions with hysteresis.
-        """
-        # Add to history
-        self.prediction_history.append({
-            'emotion': calibrated.get('emotion', 'Neutral'),
-            'confidence': calibrated.get('confidence', 0.0),
-            'emotion_source': calibrated.get('emotion_source', 'unknown')
-        })
-
-        # Keep only recent history
-        if len(self.prediction_history) > self.smoothing_window:
-            self.prediction_history = self.prediction_history[-self.smoothing_window:]
-
-        # Count emotions in history
-        emotion_counts = {}
-        emotion_confidences = {}
-        for pred in self.prediction_history:
-            em = pred['emotion']
-            emotion_counts[em] = emotion_counts.get(em, 0) + 1
-            if em not in emotion_confidences:
-                emotion_confidences[em] = []
-            emotion_confidences[em].append(pred['confidence'])
-
-        # Find most common emotion
-        most_common = max(emotion_counts, key=emotion_counts.get)
-        most_common_count = emotion_counts[most_common]
-
-        # Hysteresis: only change if new emotion appears enough times
-        if most_common != self.current_smoothed_emotion:
-            if most_common_count >= self.emotion_change_threshold:
-                self.current_smoothed_emotion = most_common
-
-        # Average confidence for the smoothed emotion
-        if self.current_smoothed_emotion in emotion_confidences:
-            avg_confidence = sum(emotion_confidences[self.current_smoothed_emotion]) / len(emotion_confidences[self.current_smoothed_emotion])
-        else:
-            avg_confidence = calibrated.get('confidence', 0.0)
-
-        # Get source from most recent prediction with this emotion
-        source = 'unknown'
-        for pred in reversed(self.prediction_history):
-            if pred['emotion'] == self.current_smoothed_emotion:
-                source = pred['emotion_source']
-                break
-
-        return {
-            'emotion': self.current_smoothed_emotion,
-            'confidence': avg_confidence,
-            'emotion_source': source,
-            'raw_emotion': calibrated.get('emotion', 'Neutral'),  # Original unsmoothed
-            'history_size': len(self.prediction_history)
-        }
+        messagebox.showinfo("Profile Loaded", f"Profile '{user_id}' loaded successfully.")
 
     # ========================================================================
     # Main Loop
     # ========================================================================
 
-    def update_comparison_display(self, raw: Dict, calibrated: Dict, smoothed: Dict = None):
+    def update_video(self, frame: np.ndarray, bbox: Optional[tuple] = None):
+        """Update video display."""
+        if frame is None:
+            return
+
+        # Draw bounding box
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # Convert BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Resize for display
+        frame_rgb = cv2.resize(frame_rgb, (480, 360))
+
+        # Convert to PhotoImage
+        img = Image.fromarray(frame_rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
+
+        self.video_label.imgtk = imgtk
+        self.video_label.configure(image=imgtk)
+
+    def update_comparison_display(self, raw: Dict, calibrated: Dict):
         """Update the side-by-side comparison."""
+        # Raw output
         self.raw_emotion_label.config(text=raw['emotion'])
         self.raw_confidence_label.config(text=f"Confidence: {raw['confidence']:.0%}")
+        self.raw_va_label.config(text=f"V: {raw['valence']:.2f} | A: {raw['arousal']:.2f}")
+        self.raw_quadrant_label.config(text=f"Quadrant: {raw['quadrant_label']}")
 
+        # Calibrated output
         if calibrated.get('calibrated', False):
-            # Use smoothed prediction if available, otherwise use raw calibrated
-            display = smoothed if smoothed else calibrated
+            self.cal_emotion_label.config(text=calibrated['emotion'])
 
-            self.cal_emotion_label.config(text=display['emotion'])
-
-            source = display.get('emotion_source', 'unknown')
+            # Show confidence and source
+            source = calibrated.get('emotion_source', 'unknown')
             source_labels = {
                 'calibration': '[CAL]',
+                'va_shift': '[V-A]',
                 'raw_model': '[RAW]'
             }
             source_label = source_labels.get(source, '[?]')
-
-            # Show if smoothed
-            smooth_indicator = " ~" if smoothed else ""
             self.cal_confidence_label.config(
-                text=f"Confidence: {display['confidence']:.0%} {source_label}{smooth_indicator}"
+                text=f"Confidence: {calibrated['confidence']:.0%} {source_label}"
             )
 
+            self.cal_va_label.config(
+                text=f"V-shift: {calibrated['valence_shift']:+.2f} | A-shift: {calibrated['arousal_shift']:+.2f}"
+            )
+            self.cal_quadrant_label.config(text=f"Quadrant: {calibrated['quadrant_label']}")
+
+            # Similarities
             sims = calibrated['similarities']
             closest = calibrated['closest_baseline']
 
@@ -751,71 +713,84 @@ class AudioCalibrationDemoApp:
         else:
             self.cal_emotion_label.config(text="[No Cal]")
             self.cal_confidence_label.config(text="Confidence: --")
+            self.cal_va_label.config(text="Calibrate first")
+            self.cal_quadrant_label.config(text="Quadrant: --")
             self.similarities_label.config(text="neutral: -- | happy: -- | calm: --")
 
-    def show_no_audio(self):
-        """Show no audio state."""
-        self.raw_emotion_label.config(text="NO AUDIO")
+    def show_no_face(self):
+        """Show no face detected state."""
+        self.raw_emotion_label.config(text="NO FACE")
         self.raw_confidence_label.config(text="Confidence: --")
-        self.cal_emotion_label.config(text="NO AUDIO")
+        self.cal_emotion_label.config(text="NO FACE")
         self.cal_confidence_label.config(text="Confidence: --")
+
+    def update_metrics(self):
+        """Update latency and FPS display."""
+        self.metrics_label.config(
+            text=f"Latency: {self.inference_time*1000:.0f} ms | FPS: {self.fps:.1f}"
+        )
 
     def main_loop(self):
         """Main processing loop (runs in thread)."""
         while self.running:
             try:
-                # Always update audio level (even during calibration)
-                current_buffer = self.audio_capture.get_current_buffer()
-                if len(current_buffer) > 0:
-                    # Show level from recent audio
-                    recent = current_buffer[-1600:] if len(current_buffer) > 1600 else current_buffer
-                    self.root.after(0, lambda r=recent: self.update_audio_level(r))
-
-                # Handle calibration
-                if self.calibration_in_progress:
-                    self.root.after(0, self._process_calibration_audio)
+                # Capture frame
+                if self.cap is None or not self.cap.isOpened():
                     time.sleep(0.1)
                     continue
 
-                # Get audio chunk
-                audio_chunk = self.audio_capture.get_chunk(timeout=0.1)
+                ret, frame = self.cap.read()
+                if not ret:
+                    time.sleep(0.01)
+                    continue
 
-                if audio_chunk is not None and len(audio_chunk) > 0:
-                    # Update level meter
-                    self.root.after(0, lambda c=audio_chunk: self.update_audio_level(c))
+                # Detect face
+                face_img, bbox = self.face_detector.detect(frame)
 
+                if face_img is not None:
                     # Run extraction
                     start_time = time.time()
-                    result = self.extractor.extract(audio_chunk, SAMPLE_RATE)
+                    result = self.extractor.extract(face_img)
                     self.inference_time = time.time() - start_time
+
+                    # If calibrating, capture frame
+                    if self.calibration_in_progress:
+                        self.root.after(0, lambda r=result: self._capture_frame_for_calibration(r))
 
                     # Get raw and calibrated predictions
                     raw = self.detector.get_raw_prediction(result)
                     calibrated = self.detector.get_calibrated_prediction(result)
 
-                    # Apply smoothing to reduce prediction jumping
-                    smoothed = self.get_smoothed_prediction(calibrated)
+                    # Update UI (must be done in main thread)
+                    self.root.after(0, lambda f=frame.copy(), b=bbox: self.update_video(f, b))
+                    self.root.after(0, lambda r=raw, c=calibrated: self.update_comparison_display(r, c))
+                else:
+                    # No face
+                    self.root.after(0, lambda f=frame.copy(): self.update_video(f, None))
+                    self.root.after(0, self.show_no_face)
 
-                    # Update UI
-                    self.root.after(0, lambda r=raw, c=calibrated, s=smoothed: self.update_comparison_display(r, c, s))
-                    self.root.after(0, lambda: self.metrics_label.config(
-                        text=f"Latency: {self.inference_time*1000:.0f} ms"
-                    ))
+                # Update FPS
+                self.frame_count += 1
+                elapsed = time.time() - self.fps_start_time
+                if elapsed >= 1.0:
+                    self.fps = self.frame_count / elapsed
+                    self.frame_count = 0
+                    self.fps_start_time = time.time()
+                    self.root.after(0, self.update_metrics)
 
-                    self.chunks_processed += 1
-
-                time.sleep(0.05)
+                time.sleep(0.01)
 
             except Exception as e:
                 print(f"Loop error: {e}")
                 import traceback
                 traceback.print_exc()
-                time.sleep(0.5)
+                time.sleep(0.1)
 
     def on_close(self):
         """Handle window close."""
         self.running = False
-        self.audio_capture.stop()
+        if self.cap:
+            self.cap.release()
         self.root.destroy()
 
     def run(self):
@@ -823,30 +798,23 @@ class AudioCalibrationDemoApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         def init():
-            self.status_label.config(text="Loading Emotion2Vec model...")
+            # Load model
+            self.status_label.config(text="Loading HSEmotion model...")
             self.root.update()
+            self.extractor.load(status_callback=lambda msg: self.root.after(0, lambda: self.status_label.config(text=msg)))
 
-            try:
-                self.extractor.load(
-                    status_callback=lambda msg: self.root.after(0, lambda: self.status_label.config(text=msg))
-                )
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load model: {e}"))
-                return
-
-            self.status_label.config(text="Starting audio capture...")
+            # Start camera
+            self.status_label.config(text=f"Starting camera {self.camera_index}...")
             self.root.update()
-
-            try:
-                self.audio_capture.start()
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to start audio: {e}"))
-                return
-
+            self.cap = cv2.VideoCapture(self.camera_index)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             time.sleep(0.5)
+
             self.running = True
             self.status_label.config(text="Ready! Click 'Calibrate' to start.")
 
+            # Start main loop
             main_thread = threading.Thread(target=self.main_loop, daemon=True)
             main_thread.start()
 
@@ -861,10 +829,12 @@ class AudioCalibrationDemoApp:
 # ============================================================================
 
 if __name__ == "__main__":
-    if AUDIO_BACKEND is None:
-        print("ERROR: sounddevice not installed.")
-        print("Install with: pip install sounddevice")
-        exit(1)
+    import argparse
+    parser = argparse.ArgumentParser(description='HSEmotion Calibration Demo')
+    parser.add_argument('--camera', type=int, default=0,
+                        help='Camera index (0=iPhone/default, 1=MacBook webcam)')
+    args = parser.parse_args()
 
-    app = AudioCalibrationDemoApp()
+    print(f"Using camera index: {args.camera}")
+    app = CalibrationDemoApp(camera_index=args.camera)
     app.run()

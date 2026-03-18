@@ -19,15 +19,13 @@ from tkinter import ttk, simpledialog, messagebox
 from PIL import Image, ImageTk
 from typing import Optional, Dict, List
 
-from calibration_core import (
+from core import (
     UserBaseline, HSEmotionExtractor, CalibrationManager,
-    CalibratedDetector, average_embeddings, average_values
-)
-from calibration_core_audio import (
+    CalibratedDetector, average_embeddings, average_values,
     AudioUserBaseline, Emotion2VecExtractor, AudioCalibrationManager,
-    CalibratedAudioDetector, average_embeddings as avg_audio_embeddings
+    CalibratedAudioDetector,
+    MultimodalFusion, FusionResult, QUADRANT_LABELS,
 )
-from fusion_core import MultimodalFusion, FusionResult, QUADRANT_LABELS
 
 try:
     import sounddevice as sd

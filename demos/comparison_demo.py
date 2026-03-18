@@ -19,7 +19,7 @@ from PIL import Image, ImageTk
 from typing import Optional, Dict, List
 
 import mediapipe as mp
-from calibration_core import HSEmotionExtractor, average_embeddings, average_values
+from core import HSEmotionExtractor, average_embeddings, average_values
 
 
 # ============================================================================
@@ -85,7 +85,7 @@ class MediaPipeExtractor:
     def __init__(self, model_path: str = None):
         if model_path is None:
             import os
-            model_path = os.path.join(os.path.dirname(__file__), 'face_landmarker.task')
+            model_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'face_landmarker.task')
 
         base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
         options = mp.tasks.vision.FaceLandmarkerOptions(

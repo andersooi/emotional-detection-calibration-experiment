@@ -364,7 +364,7 @@ class HSEmotionExtractorAdapter(BaseEmotionExtractor):
         self._extractor = None
 
     def load(self, status_callback=None):
-        from calibration_core import HSEmotionExtractor
+        from core.calibration_visual import HSEmotionExtractor
         self._extractor = HSEmotionExtractor(model_name=self.model_name)
         self._extractor.load(status_callback)
 
@@ -383,7 +383,7 @@ class Emotion2VecExtractorAdapter(BaseEmotionExtractor):
         self._extractor = None
 
     def load(self, status_callback=None):
-        from calibration_core_audio import Emotion2VecExtractor
+        from core.calibration_audio import Emotion2VecExtractor
         self._extractor = Emotion2VecExtractor(model_size=self.model_size)
         self._extractor.load(status_callback)
 
