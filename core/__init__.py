@@ -43,4 +43,5 @@ from core.calibration_base import (
     GenericCalibratedDetector,
     HSEmotionExtractorAdapter,
     Emotion2VecExtractorAdapter,
+    DeepFaceExtractor,
 )

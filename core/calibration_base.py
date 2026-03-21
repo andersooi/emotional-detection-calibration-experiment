@@ -395,3 +395,85 @@ class Emotion2VecExtractorAdapter(BaseEmotionExtractor):
 
     def has_va(self) -> bool:
         return False
+
+
+class DeepFaceExtractor(BaseEmotionExtractor):
+    """
+    DeepFace emotion extractor — embeddings + 7 emotion probs, no V-A.
+
+    Supports multiple backbone models:
+        - VGG-Face (2622-dim embedding)
+        - Facenet (128-dim)
+        - ArcFace (512-dim)
+
+    Usage:
+        extractor = DeepFaceExtractor(model_name='VGG-Face')
+        extractor.load()
+        result = extractor.extract(face_rgb_image)
+    """
+
+    def __init__(self, model_name: str = 'VGG-Face', detector_backend: str = 'skip'):
+        self.model_name = model_name
+        self.detector_backend = detector_backend
+        self._deepface = None
+
+    def load(self, status_callback=None):
+        if status_callback:
+            status_callback(f"Loading DeepFace ({self.model_name})...")
+
+        from deepface import DeepFace
+        self._deepface = DeepFace
+
+        # Warm up model (first call downloads weights)
+        dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+        try:
+            self._deepface.represent(dummy, model_name=self.model_name,
+                                     detector_backend='skip', enforce_detection=False)
+        except Exception:
+            pass
+
+        if status_callback:
+            status_callback("DeepFace loaded!")
+
+    def extract(self, face_image) -> Dict:
+        if self._deepface is None:
+            self.load()
+
+        # Get embedding
+        rep = self._deepface.represent(
+            face_image, model_name=self.model_name,
+            detector_backend=self.detector_backend,
+            enforce_detection=False
+        )
+        embedding = np.array(rep[0]['embedding'])
+
+        # Get emotion probs
+        analysis = self._deepface.analyze(
+            face_image, actions=['emotion'],
+            detector_backend=self.detector_backend,
+            enforce_detection=False
+        )
+        raw_probs = analysis[0]['emotion']
+
+        # Normalize: lowercase → PascalCase, percentages (0-100) → probabilities (0-1)
+        emotion_probs = {
+            'Anger': raw_probs.get('angry', 0.0) / 100,
+            'Disgust': raw_probs.get('disgust', 0.0) / 100,
+            'Fear': raw_probs.get('fear', 0.0) / 100,
+            'Happiness': raw_probs.get('happy', 0.0) / 100,
+            'Neutral': raw_probs.get('neutral', 0.0) / 100,
+            'Sadness': raw_probs.get('sad', 0.0) / 100,
+            'Surprise': raw_probs.get('surprise', 0.0) / 100,
+        }
+
+        top_emotion = max(emotion_probs, key=emotion_probs.get)
+
+        return {
+            'embedding': embedding,
+            'emotion_probs': emotion_probs,
+            'top_emotion': top_emotion,
+            'confidence': emotion_probs[top_emotion],
+        }
+
+    def has_va(self) -> bool:
+        return False
