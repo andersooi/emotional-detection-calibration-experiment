@@ -302,9 +302,29 @@ class GenericCalibratedDetector:
                 calibrated_emotion = state_to_emotion.get(closest_state, closest_state.title())
                 emotion_source = 'calibration'
             else:
-                # Rule 3: Fall back to raw
-                calibrated_emotion = raw_emotion
-                emotion_source = 'raw_model'
+                # Rule 3: Fall back — but check if raw emotion was a calibrated
+                # emotion that FAILED similarity. If so, calibration is saying
+                # "you don't look like YOUR neutral/happy/calm" so we shouldn't
+                # output that emotion. Instead, use the next best non-calibrated
+                # emotion from the raw model's probability distribution.
+                emotion_probs = extraction_result.get('emotion_probs', {})
+
+                if raw_emotion in self.calibrated_emotions and emotion_probs:
+                    # Raw says a calibrated emotion but calibration rejected it
+                    # Find best non-calibrated emotion
+                    non_cal_probs = {k: v for k, v in emotion_probs.items()
+                                     if k not in self.calibrated_emotions}
+                    if non_cal_probs and max(non_cal_probs.values()) > 0.05:
+                        calibrated_emotion = max(non_cal_probs, key=non_cal_probs.get)
+                        emotion_source = 'fallback'
+                    else:
+                        # No non-calibrated emotion has meaningful probability
+                        # Genuinely ambiguous — use raw
+                        calibrated_emotion = raw_emotion
+                        emotion_source = 'raw_model'
+                else:
+                    calibrated_emotion = raw_emotion
+                    emotion_source = 'raw_model'
 
         # Confidence
         if emotion_source == 'calibration':

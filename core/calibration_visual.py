@@ -319,6 +319,18 @@ class CalibratedDetector:
                 if calibrated_quadrant == 'Q3' and valence_shift < -0.15:
                     calibrated_emotion = 'Sad'
                     emotion_source = 'va_shift'
+                elif raw_emotion in CALIBRATED_EMOTIONS:
+                    # Raw says a calibrated emotion but calibration rejected it
+                    # Use next best non-calibrated emotion from raw probs
+                    emotion_probs = extraction_result.get('emotion_probs', {})
+                    non_cal_probs = {k: v for k, v in emotion_probs.items()
+                                     if k not in CALIBRATED_EMOTIONS}
+                    if non_cal_probs and max(non_cal_probs.values()) > 0.05:
+                        calibrated_emotion = max(non_cal_probs, key=non_cal_probs.get)
+                        emotion_source = 'fallback'
+                    else:
+                        calibrated_emotion = raw_emotion
+                        emotion_source = 'raw_model'
                 else:
                     calibrated_emotion = raw_emotion
                     emotion_source = 'raw_model'

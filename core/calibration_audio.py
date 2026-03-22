@@ -306,9 +306,21 @@ class CalibratedAudioDetector:
                 calibrated_emotion = 'Neutral'
                 emotion_source = 'calibration'
             else:
-                # Fall back to raw model's prediction
-                calibrated_emotion = raw_emotion
-                emotion_source = 'raw_model'
+                # Fall back — but if raw says a calibrated emotion that
+                # failed similarity, use next best non-calibrated emotion
+                emotion_probs = extraction_result.get('emotion_probs', {})
+                if raw_emotion in CALIBRATED_EMOTIONS and emotion_probs:
+                    non_cal_probs = {k: v for k, v in emotion_probs.items()
+                                     if k not in CALIBRATED_EMOTIONS}
+                    if non_cal_probs and max(non_cal_probs.values()) > 0.05:
+                        calibrated_emotion = max(non_cal_probs, key=non_cal_probs.get)
+                        emotion_source = 'fallback'
+                    else:
+                        calibrated_emotion = raw_emotion
+                        emotion_source = 'raw_model'
+                else:
+                    calibrated_emotion = raw_emotion
+                    emotion_source = 'raw_model'
 
         # Compute calibrated confidence
         if emotion_source == 'calibration':
