@@ -23,6 +23,7 @@ from core import (
     GenericCalibrationManager,
     GenericCalibratedDetector,
     average_embeddings,
+    compute_adaptive_thresholds,
 )
 
 
@@ -34,11 +35,8 @@ FRAMES_TO_AVERAGE = 25
 
 CALIBRATION_STATES = [
     {'name': 'neutral', 'label': 'Neutral', 'duration': 5,
-     'instruction': 'Look at the camera with a relaxed, natural expression.'},
-    {'name': 'happy', 'label': 'Happy', 'duration': 5,
-     'instruction': 'Think of a happy memory. Let yourself smile naturally.'},
-    {'name': 'calm', 'label': 'Calm', 'duration': 5,
-     'instruction': 'Take a deep breath. Feel relaxed and peaceful.'},
+     'instruction': 'Look at the camera with a relaxed, natural expression.\n'
+                    'This anchors YOUR resting face so the system doesn\'t misclassify it.'},
 ]
 
 COLORS = {
@@ -85,10 +83,10 @@ class DeepFaceDemoApp:
     """GUI for testing DeepFace calibration."""
 
     def __init__(self, camera_index: int = 0):
-        self.extractor = DeepFaceExtractor(model_name='VGG-Face')
+        self.extractor = DeepFaceExtractor(model_name='VGG-Face', use_emotion_embedding=False)
         self.face_detector = FaceDetector()
         self.cal_manager = GenericCalibrationManager(modality='deepface')
-        self.detector = GenericCalibratedDetector()
+        self.detector = GenericCalibratedDetector(calibrated_emotions={'Neutral'})
 
         self.camera_index = camera_index
         self.cap: Optional[cv2.VideoCapture] = None
@@ -101,6 +99,13 @@ class DeepFaceDemoApp:
         self.cal_start_time = 0.0
         self.captured_frames: List[Dict] = []
         self._temp_baseline: Optional[GenericBaseline] = None
+
+        # Prediction smoothing (reduce fluctuations)
+        self.prediction_history: List[str] = []
+        self.smoothing_window = 5
+        self.current_smoothed_emotion = "Neutral"
+
+        # (Embedding smoothing not needed — identity embeddings are already stable)
 
         # Metrics
         self.inference_time = 0.0
@@ -202,7 +207,7 @@ class DeepFaceDemoApp:
                  bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 8))
 
         self.sim_bars = {}
-        for state, color in [('neutral', '#95A5A6'), ('happy', '#2ECC71'), ('calm', '#3498DB')]:
+        for state, color in [('neutral', '#95A5A6')]:
             row = tk.Frame(sim_frame, bg=COLORS['bg_medium'])
             row.pack(fill='x', pady=3)
 
@@ -270,7 +275,7 @@ class DeepFaceDemoApp:
         self.status_label.config(text=f"Calibrating: {state['label']} ({state['duration']}s)")
 
     def _capture_frame_for_calibration(self, result: Dict):
-        if not self.cal_in_progress:
+        if not self.cal_in_progress or self.cal_state_idx >= len(CALIBRATION_STATES):
             return
         state = CALIBRATION_STATES[self.cal_state_idx]
         elapsed = time.time() - self.cal_start_time
@@ -288,12 +293,17 @@ class DeepFaceDemoApp:
             return
 
         frames = self.captured_frames[-FRAMES_TO_AVERAGE:]
-        avg_emb = average_embeddings([f['embedding'] for f in frames])
+        embeddings = [f['embedding'] for f in frames]
+        avg_emb = average_embeddings(embeddings)
 
         if self.cal_state_idx == 0:
             self._temp_baseline = GenericBaseline(user_id=self.current_user, modality='deepface')
+            self._temp_baseline.REQUIRED_STATES = ['neutral']
 
         self._temp_baseline.add_state(state['name'], avg_emb)
+
+        # Store individual frame embeddings for variance computation
+        self._cal_frame_embeddings = embeddings
 
         self.cal_state_idx += 1
         self.captured_frames = []
@@ -304,6 +314,35 @@ class DeepFaceDemoApp:
         self.progress_bar.pack_forget()
         self.instruction_label.config(text="")
         self.detector.set_baseline(self._temp_baseline)
+
+        # Compute adaptive threshold from calibration frame variance
+        # Measure how similar each captured frame was to the averaged centroid
+        from core import cosine_similarity
+        centroid = self._temp_baseline.get_embedding('neutral')
+        frame_sims = [cosine_similarity(emb, centroid) for emb in self._cal_frame_embeddings]
+
+        min_frame_sim = min(frame_sims)
+        mean_frame_sim = np.mean(frame_sims)
+        std_frame_sim = np.std(frame_sims)
+
+        # Threshold = lowest frame similarity minus a margin that accounts for
+        # the live-vs-calibration gap. During calibration, user holds still;
+        # during live use, natural micro-movements add variance.
+        # Use 3x the observed std as margin, with a minimum of 0.05
+        margin = max(0.05, std_frame_sim * 3)
+        neutral_threshold = max(0.70, min_frame_sim - margin)
+        deviation_floor = max(0.50, neutral_threshold - 0.10)
+
+        self.detector.set_adaptive_thresholds({
+            'similarity_threshold': neutral_threshold,
+            'neutral_threshold': neutral_threshold,
+            'deviation_floor': deviation_floor,
+            'raw_override_confidence': 0.60,
+        })
+        print(f"[Adaptive Neutral Calibration] threshold={neutral_threshold:.3f} floor={deviation_floor:.3f} margin={margin:.3f}")
+        print(f"  Frame sims: min={min_frame_sim:.3f} mean={mean_frame_sim:.3f} "
+              f"std={std_frame_sim:.3f} n_frames={len(frame_sims)}")
+
         self.cal_btn.config(state='normal')
         self.load_btn.config(state='normal')
         self.save_btn.config(state='normal')
@@ -333,6 +372,17 @@ class DeepFaceDemoApp:
         self.user_label.config(text=f"User: {user_id}")
         self.detector.set_baseline(baseline)
         self._temp_baseline = baseline
+
+        # For loaded profiles, use conservative default
+        # (frame variance data not available — would need to recalibrate for adaptive)
+        self.detector.set_adaptive_thresholds({
+            'similarity_threshold': 0.90,
+            'neutral_threshold': 0.90,
+            'deviation_floor': 0.80,
+            'raw_override_confidence': 0.60,
+        })
+        print(f"[Loaded Profile] Using default threshold=0.90 (recalibrate for adaptive)")
+
         self.save_btn.config(state='normal')
         self.status_label.config(text=f"Loaded profile for '{user_id}'")
 
@@ -353,20 +403,45 @@ class DeepFaceDemoApp:
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
+    def _smooth_emotion(self, emotion: str) -> str:
+        """Smooth predictions over a window to reduce flickering."""
+        self.prediction_history.append(emotion)
+        if len(self.prediction_history) > self.smoothing_window:
+            self.prediction_history = self.prediction_history[-self.smoothing_window:]
+
+        # Majority vote
+        from collections import Counter
+        counts = Counter(self.prediction_history)
+        most_common, count = counts.most_common(1)[0]
+
+        # Require majority (>50%) to change
+        if count > len(self.prediction_history) / 2:
+            self.current_smoothed_emotion = most_common
+
+        return self.current_smoothed_emotion
+
     def update_comparison(self, raw: Dict, calibrated: Dict):
         self.raw_emotion.config(text=raw['emotion'])
         self.raw_confidence.config(text=f"Confidence: {raw['confidence']:.0%}")
 
         if calibrated.get('calibrated'):
             source = calibrated.get('emotion_source', '')
-            tag = {'calibration': '[CAL]', 'raw_model': '[RAW]'}.get(source, '')
-            self.cal_emotion.config(text=calibrated['emotion'])
-            self.cal_confidence.config(text=f"Confidence: {calibrated['confidence']:.0%} {tag}")
+            tag = {'calibration': '[CAL]', 'raw_model': '[RAW]', 'fallback': '[FB]',
+                   'deviation_fallback': '[DEV]'}.get(source, f'[{source}]')
+
+            # Apply smoothing to reduce flickering
+            raw_cal_emotion = calibrated['emotion']
+            smoothed = self._smooth_emotion(raw_cal_emotion)
+            self.cal_emotion.config(text=smoothed)
+
+            # Show both smoothed and instant prediction
+            smooth_note = f" ({raw_cal_emotion})" if raw_cal_emotion != smoothed else ""
+            self.cal_confidence.config(text=f"Confidence: {calibrated['confidence']:.0%} {tag}{smooth_note}")
 
             sims = calibrated.get('similarities', {})
             closest = calibrated.get('closest_baseline', '')
 
-            for state in ['neutral', 'happy', 'calm']:
+            for state in ['neutral']:
                 if state in sims:
                     sim = sims[state]
                     canvas = self.sim_bars[state]['canvas']
@@ -384,7 +459,7 @@ class DeepFaceDemoApp:
         else:
             self.cal_emotion.config(text="[No Cal]")
             self.cal_confidence.config(text="Calibrate first")
-            for state in ['neutral', 'happy', 'calm']:
+            for state in ['neutral']:
                 self.sim_bars[state]['canvas'].delete('all')
                 self.sim_bars[state]['label'].config(text="--")
 

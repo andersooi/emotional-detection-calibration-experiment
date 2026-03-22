@@ -212,10 +212,22 @@ class CalibratedAudioDetector:
 
     def __init__(self):
         self.baseline: Optional[AudioUserBaseline] = None
+        self.similarity_threshold: float = 0.80
+        self.neutral_threshold: float = 0.85
+        self.raw_override_confidence: float = 0.60
+        self.deviation_floor: float = 0.60
+        self.calibrated_emotions: set = {'Happy', 'Neutral', 'Calm'}
 
     def set_baseline(self, baseline: AudioUserBaseline):
         """Set the user baseline for calibrated predictions."""
         self.baseline = baseline
+
+    def set_adaptive_thresholds(self, thresholds: Dict):
+        """Apply adaptive thresholds from compute_adaptive_thresholds()."""
+        self.similarity_threshold = thresholds['similarity_threshold']
+        self.neutral_threshold = thresholds['neutral_threshold']
+        self.deviation_floor = thresholds['deviation_floor']
+        self.raw_override_confidence = thresholds['raw_override_confidence']
 
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""
@@ -275,52 +287,59 @@ class CalibratedAudioDetector:
         closest_state = max(similarities, key=similarities.get)
         closest_similarity = similarities[closest_state]
 
-        # Determine calibrated emotion using hybrid approach
+        # Decision logic (calibration holds priority)
         raw_emotion = extraction_result['top_emotion']
         raw_confidence = extraction_result['confidence']
+        below_deviation_floor = closest_similarity < self.deviation_floor
+        emotion_probs = extraction_result.get('emotion_probs', {})
 
-        # Calibrated states we know about
-        CALIBRATED_EMOTIONS = {'Happy', 'Neutral', 'Calm'}
+        def _best_non_cal():
+            non_cal = {k: v for k, v in emotion_probs.items()
+                       if k not in self.calibrated_emotions}
+            if non_cal and max(non_cal.values()) > 0.05:
+                return max(non_cal, key=non_cal.get)
+            return None
 
-        # Key rule: If raw model confidently detects a NON-calibrated emotion
-        # (e.g., Sad, Angry, Fear), trust the raw model — calibration has no
-        # reference for these states and could misclassify them.
-        RAW_OVERRIDE_CONFIDENCE = 0.60
+        # Rule 1: Closest baseline passes threshold → use calibration (priority)
+        if closest_state == 'happy' and closest_similarity > self.similarity_threshold:
+            calibrated_emotion = 'Happy'
+            emotion_source = 'calibration'
+        elif closest_state == 'calm' and closest_similarity > self.similarity_threshold:
+            calibrated_emotion = 'Calm'
+            emotion_source = 'calibration'
+        elif closest_state == 'neutral' and closest_similarity > self.neutral_threshold:
+            calibrated_emotion = 'Neutral'
+            emotion_source = 'calibration'
 
-        if raw_emotion not in CALIBRATED_EMOTIONS and raw_confidence > RAW_OVERRIDE_CONFIDENCE:
-            # Raw model is confident about an emotion we didn't calibrate for
+        # Rule 2: Raw model confidently detects non-calibrated emotion
+        elif raw_emotion not in self.calibrated_emotions and raw_confidence > self.raw_override_confidence:
             calibrated_emotion = raw_emotion
             emotion_source = 'raw_model'
-        else:
-            # Apply calibration for emotions we have baselines for
-            HAPPY_CALM_THRESHOLD = 0.80
-            NEUTRAL_THRESHOLD = 0.85
 
-            if closest_state == 'happy' and closest_similarity > HAPPY_CALM_THRESHOLD:
-                calibrated_emotion = 'Happy'
-                emotion_source = 'calibration'
-            elif closest_state == 'calm' and closest_similarity > HAPPY_CALM_THRESHOLD:
-                calibrated_emotion = 'Calm'
-                emotion_source = 'calibration'
-            elif closest_state == 'neutral' and closest_similarity > NEUTRAL_THRESHOLD:
-                calibrated_emotion = 'Neutral'
-                emotion_source = 'calibration'
+        # Rule 3: Below deviation floor → user in uncalibrated territory
+        elif below_deviation_floor:
+            best = _best_non_cal()
+            if best:
+                calibrated_emotion = best
+                emotion_source = 'deviation_fallback'
             else:
-                # Fall back — but if raw says a calibrated emotion that
-                # failed similarity, use next best non-calibrated emotion
-                emotion_probs = extraction_result.get('emotion_probs', {})
-                if raw_emotion in CALIBRATED_EMOTIONS and emotion_probs:
-                    non_cal_probs = {k: v for k, v in emotion_probs.items()
-                                     if k not in CALIBRATED_EMOTIONS}
-                    if non_cal_probs and max(non_cal_probs.values()) > 0.05:
-                        calibrated_emotion = max(non_cal_probs, key=non_cal_probs.get)
-                        emotion_source = 'fallback'
-                    else:
-                        calibrated_emotion = raw_emotion
-                        emotion_source = 'raw_model'
-                else:
-                    calibrated_emotion = raw_emotion
-                    emotion_source = 'raw_model'
+                calibrated_emotion = raw_emotion
+                emotion_source = 'raw_model'
+
+        # Rule 4: Raw says calibrated emotion but rejected → use best non-cal
+        elif raw_emotion in self.calibrated_emotions:
+            best = _best_non_cal()
+            if best:
+                calibrated_emotion = best
+                emotion_source = 'fallback'
+            else:
+                calibrated_emotion = raw_emotion
+                emotion_source = 'raw_model'
+
+        # Rule 5: Otherwise → raw model
+        else:
+            calibrated_emotion = raw_emotion
+            emotion_source = 'raw_model'
 
         # Compute calibrated confidence
         if emotion_source == 'calibration':

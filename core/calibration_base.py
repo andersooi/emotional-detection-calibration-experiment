@@ -220,7 +220,8 @@ class GenericCalibratedDetector:
         calibrated_emotions: Optional[set] = None,
         similarity_threshold: float = 0.80,
         neutral_threshold: float = 0.85,
-        raw_override_confidence: float = 0.60
+        raw_override_confidence: float = 0.60,
+        deviation_floor: float = 0.60,
     ):
         """
         Args:
@@ -230,15 +231,25 @@ class GenericCalibratedDetector:
             neutral_threshold: Stricter threshold for neutral state.
             raw_override_confidence: If raw model detects a non-calibrated emotion
                 above this confidence, trust raw model.
+            deviation_floor: If max similarity to ALL baselines is below this,
+                user has deviated into uncalibrated territory.
         """
         self.baseline: Optional[GenericBaseline] = None
         self.calibrated_emotions = calibrated_emotions or {'Happy', 'Neutral', 'Calm'}
         self.similarity_threshold = similarity_threshold
         self.neutral_threshold = neutral_threshold
         self.raw_override_confidence = raw_override_confidence
+        self.deviation_floor = deviation_floor
 
     def set_baseline(self, baseline: GenericBaseline):
         self.baseline = baseline
+
+    def set_adaptive_thresholds(self, thresholds: Dict):
+        """Apply adaptive thresholds from compute_adaptive_thresholds()."""
+        self.similarity_threshold = thresholds['similarity_threshold']
+        self.neutral_threshold = thresholds['neutral_threshold']
+        self.deviation_floor = thresholds['deviation_floor']
+        self.raw_override_confidence = thresholds['raw_override_confidence']
 
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         norm_a = np.linalg.norm(a)
@@ -286,45 +297,66 @@ class GenericCalibratedDetector:
         raw_emotion = extraction_result['top_emotion']
         raw_confidence = extraction_result['confidence']
 
-        # Decision logic
-        # Rule 1: If raw model confidently detects non-calibrated emotion, trust it
-        if raw_emotion not in self.calibrated_emotions and raw_confidence > self.raw_override_confidence:
+        # Check if user has deviated far from ALL baselines
+        below_deviation_floor = closest_similarity < self.deviation_floor
+        emotion_probs = extraction_result.get('emotion_probs', {})
+
+        # Helper: find best non-calibrated emotion from raw probs
+        def _best_non_cal():
+            non_cal = {k: v for k, v in emotion_probs.items()
+                       if k not in self.calibrated_emotions}
+            if non_cal and max(non_cal.values()) > 0.05:
+                return max(non_cal, key=non_cal.get)
+            return None
+
+        # Decision logic: calibration has priority, but very confident raw
+        # predictions require stronger calibration match to override.
+        # If raw says non-calibrated emotion at >90%, boost the threshold
+        # so only a strong calibration match can override it.
+        raw_is_strong_noncat = (
+            raw_emotion not in self.calibrated_emotions and raw_confidence > 0.90
+        )
+        effective_sim_threshold = self.similarity_threshold + (0.05 if raw_is_strong_noncat else 0)
+        effective_neu_threshold = self.neutral_threshold + (0.05 if raw_is_strong_noncat else 0)
+
+        # Rule 1: Closest baseline passes threshold → use calibration
+        if closest_state == 'neutral' and closest_similarity > effective_neu_threshold:
+            calibrated_emotion = 'Neutral'
+            emotion_source = 'calibration'
+        elif closest_similarity > effective_sim_threshold:
+            state_to_emotion = {'neutral': 'Neutral', 'happy': 'Happy', 'calm': 'Calm'}
+            calibrated_emotion = state_to_emotion.get(closest_state, closest_state.title())
+            emotion_source = 'calibration'
+
+        # Rule 2: Raw model confidently detects non-calibrated emotion
+        elif raw_emotion not in self.calibrated_emotions and raw_confidence > self.raw_override_confidence:
             calibrated_emotion = raw_emotion
             emotion_source = 'raw_model'
-        else:
-            # Rule 2: Check similarity to calibrated baselines
-            if closest_state == 'neutral' and closest_similarity > self.neutral_threshold:
-                calibrated_emotion = 'Neutral'
-                emotion_source = 'calibration'
-            elif closest_similarity > self.similarity_threshold:
-                # Map state name to emotion label
-                state_to_emotion = {'neutral': 'Neutral', 'happy': 'Happy', 'calm': 'Calm'}
-                calibrated_emotion = state_to_emotion.get(closest_state, closest_state.title())
-                emotion_source = 'calibration'
-            else:
-                # Rule 3: Fall back — but check if raw emotion was a calibrated
-                # emotion that FAILED similarity. If so, calibration is saying
-                # "you don't look like YOUR neutral/happy/calm" so we shouldn't
-                # output that emotion. Instead, use the next best non-calibrated
-                # emotion from the raw model's probability distribution.
-                emotion_probs = extraction_result.get('emotion_probs', {})
 
-                if raw_emotion in self.calibrated_emotions and emotion_probs:
-                    # Raw says a calibrated emotion but calibration rejected it
-                    # Find best non-calibrated emotion
-                    non_cal_probs = {k: v for k, v in emotion_probs.items()
-                                     if k not in self.calibrated_emotions}
-                    if non_cal_probs and max(non_cal_probs.values()) > 0.05:
-                        calibrated_emotion = max(non_cal_probs, key=non_cal_probs.get)
-                        emotion_source = 'fallback'
-                    else:
-                        # No non-calibrated emotion has meaningful probability
-                        # Genuinely ambiguous — use raw
-                        calibrated_emotion = raw_emotion
-                        emotion_source = 'raw_model'
-                else:
-                    calibrated_emotion = raw_emotion
-                    emotion_source = 'raw_model'
+        # Rule 3: Below deviation floor → user in uncalibrated territory
+        elif below_deviation_floor:
+            best = _best_non_cal()
+            if best:
+                calibrated_emotion = best
+                emotion_source = 'deviation_fallback'
+            else:
+                calibrated_emotion = raw_emotion
+                emotion_source = 'raw_model'
+
+        # Rule 4: Raw says calibrated emotion but rejected → use best non-cal
+        elif raw_emotion in self.calibrated_emotions:
+            best = _best_non_cal()
+            if best:
+                calibrated_emotion = best
+                emotion_source = 'fallback'
+            else:
+                calibrated_emotion = raw_emotion
+                emotion_source = 'raw_model'
+
+        # Rule 5: Otherwise → raw model
+        else:
+            calibrated_emotion = raw_emotion
+            emotion_source = 'raw_model'
 
         # Confidence
         if emotion_source == 'calibration':
@@ -357,6 +389,66 @@ class GenericCalibratedDetector:
 # ============================================================================
 # Utility Functions
 # ============================================================================
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine similarity between two vectors."""
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def compute_adaptive_thresholds(
+    neutral_emb: np.ndarray,
+    happy_emb: np.ndarray,
+    calm_emb: np.ndarray,
+    margin: float = 0.03,
+) -> Dict:
+    """
+    Compute user-adaptive similarity thresholds from calibration baselines.
+
+    If baselines are close together (subtle expressions), thresholds are strict.
+    If baselines are far apart (expressive user), thresholds are looser.
+
+    Returns dict with similarity_threshold, neutral_threshold, deviation_floor,
+    raw_override_confidence, and diagnostics.
+    """
+    sim_nh = cosine_similarity(neutral_emb, happy_emb)
+    sim_nc = cosine_similarity(neutral_emb, calm_emb)
+    sim_hc = cosine_similarity(happy_emb, calm_emb)
+
+    max_inter_sim = max(sim_nh, sim_nc, sim_hc)
+    min_inter_sim = min(sim_nh, sim_nc, sim_hc)
+
+    # Threshold is a fraction of max_inter_sim.
+    # During calibration, averaged baselines have very high inter-similarity (~0.99).
+    # But live embeddings score lower (~0.85-0.90) due to movement, lighting, etc.
+    # We set thresholds at 85% and 80% of the inter-baseline similarity to account
+    # for this live-to-calibration gap.
+    #
+    # Examples:
+    #   DeepFace (max_inter=0.99): threshold=0.84, floor=0.79
+    #   HSEmotion (max_inter=0.92): threshold=0.78, floor=0.74
+    #   Expressive (max_inter=0.80): threshold=0.70, floor=0.64
+    similarity_threshold = max(0.65, min(0.95, max_inter_sim * 0.85))
+    neutral_threshold = max(0.65, min(0.95, max_inter_sim * 0.86))
+    deviation_floor = max(0.50, min(0.90, max_inter_sim * 0.79))
+
+    return {
+        'similarity_threshold': similarity_threshold,
+        'neutral_threshold': neutral_threshold,
+        'deviation_floor': deviation_floor,
+        'raw_override_confidence': 0.60,
+        'diagnostics': {
+            'sim_neutral_happy': sim_nh,
+            'sim_neutral_calm': sim_nc,
+            'sim_happy_calm': sim_hc,
+            'max_inter_sim': max_inter_sim,
+            'min_inter_sim': min_inter_sim,
+        },
+    }
+
 
 def average_embeddings(embeddings: List[np.ndarray]) -> np.ndarray:
     """Average a list of embeddings into a single centroid."""
@@ -419,22 +511,27 @@ class Emotion2VecExtractorAdapter(BaseEmotionExtractor):
 
 class DeepFaceExtractor(BaseEmotionExtractor):
     """
-    DeepFace emotion extractor — embeddings + 7 emotion probs, no V-A.
+    DeepFace emotion extractor — emotion probs used as embedding for calibration.
 
-    Supports multiple backbone models:
-        - VGG-Face (2622-dim embedding)
-        - Facenet (128-dim)
-        - ArcFace (512-dim)
+    By default, uses the 7-dim emotion probability vector as the "embedding"
+    for cosine similarity calibration. This works better than the identity
+    embedding (VGG-Face 4096-dim) because the emotion classifier is trained
+    to separate emotions, while the identity embedding is trained to match
+    the same person regardless of expression.
+
+    Set use_emotion_embedding=False to use the identity embedding instead.
 
     Usage:
-        extractor = DeepFaceExtractor(model_name='VGG-Face')
+        extractor = DeepFaceExtractor()
         extractor.load()
         result = extractor.extract(face_rgb_image)
     """
 
-    def __init__(self, model_name: str = 'VGG-Face', detector_backend: str = 'skip'):
+    def __init__(self, model_name: str = 'VGG-Face', detector_backend: str = 'skip',
+                 use_emotion_embedding: bool = True):
         self.model_name = model_name
         self.detector_backend = detector_backend
+        self.use_emotion_embedding = use_emotion_embedding
         self._deepface = None
 
     def load(self, status_callback=None):
@@ -447,8 +544,11 @@ class DeepFaceExtractor(BaseEmotionExtractor):
         # Warm up model (first call downloads weights)
         dummy = np.zeros((224, 224, 3), dtype=np.uint8)
         try:
-            self._deepface.represent(dummy, model_name=self.model_name,
-                                     detector_backend='skip', enforce_detection=False)
+            self._deepface.analyze(dummy, actions=['emotion'],
+                                   detector_backend='skip', enforce_detection=False)
+            if not self.use_emotion_embedding:
+                self._deepface.represent(dummy, model_name=self.model_name,
+                                         detector_backend='skip', enforce_detection=False)
         except Exception:
             pass
 
@@ -458,14 +558,6 @@ class DeepFaceExtractor(BaseEmotionExtractor):
     def extract(self, face_image) -> Dict:
         if self._deepface is None:
             self.load()
-
-        # Get embedding
-        rep = self._deepface.represent(
-            face_image, model_name=self.model_name,
-            detector_backend=self.detector_backend,
-            enforce_detection=False
-        )
-        embedding = np.array(rep[0]['embedding'])
 
         # Get emotion probs
         analysis = self._deepface.analyze(
@@ -487,6 +579,20 @@ class DeepFaceExtractor(BaseEmotionExtractor):
         }
 
         top_emotion = max(emotion_probs, key=emotion_probs.get)
+
+        # Use emotion probability vector as embedding for calibration
+        # This is a 7-dim vector where each dimension is an emotion probability
+        # Cosine similarity on this vector compares emotion DISTRIBUTIONS
+        if self.use_emotion_embedding:
+            embedding = np.array(list(emotion_probs.values()))
+        else:
+            # Fall back to identity embedding
+            rep = self._deepface.represent(
+                face_image, model_name=self.model_name,
+                detector_backend=self.detector_backend,
+                enforce_detection=False
+            )
+            embedding = np.array(rep[0]['embedding'])
 
         return {
             'embedding': embedding,
