@@ -47,13 +47,6 @@ CALIBRATION_STATES = [
                       'Let yourself smile naturally.',
         'duration': 5
     },
-    {
-        'name': 'calm',
-        'label': 'Calm',
-        'instruction': 'Take a slow, deep breath. Feel relaxed and peaceful.\n'
-                      'This is your calm, content state.',
-        'duration': 5
-    }
 ]
 
 # How many frames to average for baseline (last 3-4 seconds at ~10fps)
@@ -393,16 +386,24 @@ class CalibrationDemoApp:
             font=('Helvetica', 10, 'bold'),
             bg=COLORS['bg_medium'],
             fg=COLORS['text_white']
-        ).pack()
+        ).pack(pady=(0, 8))
 
-        self.similarities_label = tk.Label(
-            sim_frame,
-            text="neutral: -- | happy: -- | calm: --",
-            font=('Helvetica', 10),
-            bg=COLORS['bg_medium'],
-            fg=COLORS['text_gray']
-        )
-        self.similarities_label.pack(pady=5)
+        self.sim_bars = {}
+        for state, color in [('neutral', '#95A5A6'), ('happy', '#2ECC71')]:
+            row = tk.Frame(sim_frame, bg=COLORS['bg_medium'])
+            row.pack(fill='x', pady=3)
+
+            tk.Label(row, text=state.title(), font=('Helvetica', 10), width=8, anchor='e',
+                     bg=COLORS['bg_medium'], fg=COLORS['text_gray']).pack(side='left')
+
+            bar_bg = tk.Canvas(row, width=200, height=22, bg='#1e293b', highlightthickness=0)
+            bar_bg.pack(side='left', padx=8)
+
+            val_label = tk.Label(row, text="--", font=('Helvetica', 10, 'bold'), width=5,
+                                 bg=COLORS['bg_medium'], fg=COLORS['text_white'])
+            val_label.pack(side='left')
+
+            self.sim_bars[state] = {'canvas': bar_bg, 'label': val_label, 'color': color}
 
     def _create_bottom_bar(self, parent):
         """Create bottom bar with buttons and metrics."""
@@ -514,7 +515,7 @@ class CalibrationDemoApp:
 
     def _capture_frame_for_calibration(self, result: Dict):
         """Capture a frame during calibration."""
-        if not self.calibration_in_progress:
+        if not self.calibration_in_progress or self.calibration_state_idx >= len(CALIBRATION_STATES):
             return
 
         state = CALIBRATION_STATES[self.calibration_state_idx]
@@ -700,22 +701,33 @@ class CalibrationDemoApp:
             )
             self.cal_quadrant_label.config(text=f"Quadrant: {calibrated['quadrant_label']}")
 
-            # Similarities
+            # Similarity bars
             sims = calibrated['similarities']
             closest = calibrated['closest_baseline']
 
-            sim_text = ""
-            for state in ['neutral', 'happy', 'calm']:
-                marker = "*" if state == closest else ""
-                sim_text += f"{state}: {sims[state]:.2f}{marker}  "
+            for state in ['neutral', 'happy']:
+                if state in sims:
+                    sim = sims[state]
+                    canvas = self.sim_bars[state]['canvas']
+                    label = self.sim_bars[state]['label']
+                    color = self.sim_bars[state]['color']
 
-            self.similarities_label.config(text=sim_text)
+                    canvas.delete('all')
+                    bar_width = max(0, min(200, int(200 * sim)))
+                    if bar_width > 0:
+                        fill = color if state == closest else '#475569'
+                        canvas.create_rectangle(0, 0, bar_width, 22, fill=fill, outline='')
+
+                    label.config(text=f"{sim:.3f}")
+                    label.config(fg=color if state == closest else COLORS['text_gray'])
         else:
             self.cal_emotion_label.config(text="[No Cal]")
             self.cal_confidence_label.config(text="Confidence: --")
             self.cal_va_label.config(text="Calibrate first")
             self.cal_quadrant_label.config(text="Quadrant: --")
-            self.similarities_label.config(text="neutral: -- | happy: -- | calm: --")
+            for state in ['neutral', 'happy']:
+                self.sim_bars[state]['canvas'].delete('all')
+                self.sim_bars[state]['label'].config(text="--")
 
     def show_no_face(self):
         """Show no face detected state."""

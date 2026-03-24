@@ -44,6 +44,7 @@ from core.calibration_base import (
     HSEmotionExtractorAdapter,
     Emotion2VecExtractorAdapter,
     DeepFaceExtractor,
+    DeepFaceEmotionEmbeddingExtractor,
     cosine_similarity,
     compute_adaptive_thresholds,
 )

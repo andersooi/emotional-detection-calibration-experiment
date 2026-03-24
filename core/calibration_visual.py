@@ -45,8 +45,7 @@ class UserBaseline:
         """Check if minimum calibration requirements are met."""
         return (
             self.neutral_embedding is not None and
-            self.happy_embedding is not None and
-            self.calm_embedding is not None
+            self.happy_embedding is not None
         )
 
 
@@ -273,15 +272,13 @@ class CalibratedDetector:
         current_arousal = extraction_result['arousal']
 
         # Compute similarities to baseline states
-        sim_neutral = self._cosine_similarity(current_embedding, self.baseline.neutral_embedding)
-        sim_happy = self._cosine_similarity(current_embedding, self.baseline.happy_embedding)
-        sim_calm = self._cosine_similarity(current_embedding, self.baseline.calm_embedding)
-
-        similarities = {
-            'neutral': sim_neutral,
-            'happy': sim_happy,
-            'calm': sim_calm
-        }
+        similarities = {}
+        if self.baseline.neutral_embedding is not None:
+            similarities['neutral'] = self._cosine_similarity(current_embedding, self.baseline.neutral_embedding)
+        if self.baseline.happy_embedding is not None:
+            similarities['happy'] = self._cosine_similarity(current_embedding, self.baseline.happy_embedding)
+        if self.baseline.calm_embedding is not None:
+            similarities['calm'] = self._cosine_similarity(current_embedding, self.baseline.calm_embedding)
 
         # Find closest baseline state
         closest_state = max(similarities, key=similarities.get)

@@ -603,3 +603,82 @@ class DeepFaceExtractor(BaseEmotionExtractor):
 
     def has_va(self) -> bool:
         return False
+
+
+class DeepFaceEmotionEmbeddingExtractor(BaseEmotionExtractor):
+    """
+    Extracts 1024-dim embeddings from DeepFace's EMOTION model (not the identity model).
+
+    DeepFace's emotion classifier is a custom CNN:
+        Conv layers → Flatten → Dense(1024) → Dense(1024) → Dense(7, softmax)
+
+    We extract the penultimate Dense(1024) output as the embedding.
+    This is emotion-trained (unlike VGG-Face identity embeddings) and should
+    separate emotions better for cosine similarity calibration.
+    """
+
+    def __init__(self):
+        self._deepface = None
+        self._emotion_model = None
+        self._embedding_model = None
+
+    def load(self, status_callback=None):
+        if status_callback:
+            status_callback("Loading DeepFace emotion embedding model...")
+
+        from deepface import DeepFace
+        self._deepface = DeepFace
+
+        # Load the emotion model
+        from deepface.models.demography.Emotion import EmotionClient
+        client = EmotionClient()
+        self._emotion_model = client.model
+
+        # Create sub-model that outputs penultimate Dense(1024) layer
+        # Architecture: ... → Dense(1024) → Dropout → Dense(1024) → Dropout → Dense(7)
+        # layers[-3] is the second Dense(1024) before final Dropout and Dense(7)
+        import tensorflow as tf
+        self._embedding_model = tf.keras.Model(
+            inputs=self._emotion_model.input,
+            outputs=self._emotion_model.layers[-3].output
+        )
+
+        if status_callback:
+            status_callback("DeepFace emotion embedding model loaded!")
+
+    def _preprocess(self, face_image):
+        """Preprocess face image for emotion model: RGB → grayscale → 48x48."""
+        import cv2
+        if len(face_image.shape) == 3:
+            gray = cv2.cvtColor(face_image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = face_image
+        gray = cv2.resize(gray, (48, 48))
+        return np.expand_dims(np.expand_dims(gray, axis=-1), axis=0).astype(np.float32)
+
+    def extract(self, face_image) -> Dict:
+        if self._embedding_model is None:
+            self.load()
+
+        preprocessed = self._preprocess(face_image)
+
+        # Get 1024-dim emotion embedding
+        embedding = self._embedding_model.predict(preprocessed, verbose=0)[0]
+
+        # Get emotion probabilities from full model
+        probs = self._emotion_model.predict(preprocessed, verbose=0)[0]
+
+        # Must match DeepFace's Emotion.py label order exactly
+        labels = ['Anger', 'Disgust', 'Fear', 'Happiness', 'Sadness', 'Surprise', 'Neutral']
+        emotion_probs = {label: float(probs[i]) for i, label in enumerate(labels)}
+        top_emotion = max(emotion_probs, key=emotion_probs.get)
+
+        return {
+            'embedding': embedding,
+            'emotion_probs': emotion_probs,
+            'top_emotion': top_emotion,
+            'confidence': emotion_probs[top_emotion],
+        }
+
+    def has_va(self) -> bool:
+        return False
