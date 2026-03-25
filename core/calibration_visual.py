@@ -194,7 +194,11 @@ class CalibratedDetector:
         self.neutral_threshold: float = 0.85
         self.raw_override_confidence: float = 0.60
         self.deviation_floor: float = 0.60
-        self.calibrated_emotions: set = {'Happiness', 'Neutral', 'Calm'}
+        self.calibrated_emotions: set = {'Happiness', 'Neutral'}
+
+        # V-A shift thresholds (adaptive from calibration variance)
+        self.va_strong_threshold: float = -0.25   # overrides calibration
+        self.va_moderate_threshold: float = -0.15  # fires after calibration miss
 
     def set_baseline(self, baseline: UserBaseline):
         """Set the user baseline for calibrated predictions."""
@@ -206,6 +210,10 @@ class CalibratedDetector:
         self.neutral_threshold = thresholds['neutral_threshold']
         self.deviation_floor = thresholds['deviation_floor']
         self.raw_override_confidence = thresholds['raw_override_confidence']
+        if 'va_strong_threshold' in thresholds:
+            self.va_strong_threshold = thresholds['va_strong_threshold']
+        if 'va_moderate_threshold' in thresholds:
+            self.va_moderate_threshold = thresholds['va_moderate_threshold']
 
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         """Compute cosine similarity between two vectors."""
@@ -247,7 +255,8 @@ class CalibratedDetector:
             'valence': valence,
             'arousal': arousal,
             'quadrant': self._va_to_quadrant(valence, arousal),
-            'quadrant_label': self.QUADRANT_LABELS[self._va_to_quadrant(valence, arousal)]
+            'quadrant_label': self.QUADRANT_LABELS[self._va_to_quadrant(valence, arousal)],
+            'emotion_probs': extraction_result.get('emotion_probs', {}),
         }
 
     def get_calibrated_prediction(self, extraction_result: Dict) -> Dict:
@@ -304,12 +313,15 @@ class CalibratedDetector:
                 return max(non_cal, key=non_cal.get)
             return None
 
-        # Rule 1: Closest baseline passes threshold → use calibration (priority)
-        if closest_state == 'happy' and closest_similarity > self.similarity_threshold:
+        # Rule 0: Strong V-A shift overrides everything (clearly negative face)
+        # This prevents calibration from suppressing obvious sadness.
+        if calibrated_quadrant == 'Q3' and valence_shift < self.va_strong_threshold:
+            calibrated_emotion = 'Sad'
+            emotion_source = 'va_override'
+
+        # Rule 1: Closest baseline passes threshold → use calibration
+        elif closest_state == 'happy' and closest_similarity > self.similarity_threshold:
             calibrated_emotion = 'Happy'
-            emotion_source = 'calibration'
-        elif closest_state == 'calm' and closest_similarity > self.similarity_threshold:
-            calibrated_emotion = 'Calm'
             emotion_source = 'calibration'
         elif closest_state == 'neutral' and closest_similarity > self.neutral_threshold:
             calibrated_emotion = 'Neutral'
@@ -320,8 +332,8 @@ class CalibratedDetector:
             calibrated_emotion = raw_emotion
             emotion_source = 'raw_model'
 
-        # Rule 2b: V-A shift detects sadness (HSEmotion only)
-        elif calibrated_quadrant == 'Q3' and valence_shift < -0.15:
+        # Rule 2b: Moderate V-A shift (fires when calibration didn't match)
+        elif calibrated_quadrant == 'Q3' and valence_shift < self.va_moderate_threshold:
             calibrated_emotion = 'Sad'
             emotion_source = 'va_shift'
 
@@ -354,7 +366,7 @@ class CalibratedDetector:
         if emotion_source == 'calibration':
             # High similarity to baseline - use similarity as confidence
             calibrated_confidence = closest_similarity
-        elif emotion_source == 'va_shift':
+        elif emotion_source in ('va_shift', 'va_override'):
             # V-A shift detected sadness - confidence based on how strong the shift is
             calibrated_confidence = min(0.7 + abs(valence_shift) * 0.5, 0.95)
         else:

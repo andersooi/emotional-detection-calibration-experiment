@@ -23,7 +23,8 @@ from core import (
     CalibrationManager,
     CalibratedDetector,
     average_embeddings,
-    average_values
+    average_values,
+    cosine_similarity,
 )
 
 
@@ -64,7 +65,6 @@ COLORS = {
     'accent_yellow': '#F1C40F',
     'neutral': '#95A5A6',
     'happy': '#2ECC71',
-    'calm': '#3498DB',
     'sad': '#9B59B6',
     'stressed': '#E74C3C'
 }
@@ -153,7 +153,7 @@ class CalibrationDemoApp:
         # Setup GUI
         self.root = tk.Tk()
         self.root.title("AIRA Calibration Test - Raw vs Calibrated")
-        self.root.geometry("1100x700")
+        self.root.geometry("1100x850")
         self.root.configure(bg=COLORS['bg_dark'])
 
         self._setup_ui()
@@ -405,6 +405,34 @@ class CalibrationDemoApp:
 
             self.sim_bars[state] = {'canvas': bar_bg, 'label': val_label, 'color': color}
 
+        # --- Raw Probability Bars ---
+        prob_frame = tk.Frame(parent, bg=COLORS['bg_medium'])
+        prob_frame.pack(fill='x', pady=(15, 0))
+
+        tk.Label(prob_frame, text="RAW PROBABILITIES",
+                 font=('Helvetica', 10, 'bold'),
+                 bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 4))
+
+        emotion_colors = {
+            'Anger': '#E74C3C', 'Contempt': '#7F8C8D', 'Disgust': '#8E44AD',
+            'Fear': '#9B59B6', 'Happiness': '#F1C40F', 'Neutral': '#95A5A6',
+            'Sadness': '#3498DB', 'Surprise': '#E67E22',
+        }
+        self.prob_bars = {}
+        for label in ['Anger', 'Contempt', 'Disgust', 'Fear', 'Happiness',
+                       'Neutral', 'Sadness', 'Surprise']:
+            row = tk.Frame(prob_frame, bg=COLORS['bg_medium'])
+            row.pack(fill='x', pady=1)
+            tk.Label(row, text=label[:8], font=('Helvetica', 9), width=10, anchor='e',
+                     bg=COLORS['bg_medium'], fg=COLORS['text_gray']).pack(side='left')
+            canvas = tk.Canvas(row, width=140, height=14, bg='#1e293b', highlightthickness=0)
+            canvas.pack(side='left', padx=(8, 2))
+            val_lbl = tk.Label(row, text="--", font=('Helvetica', 8), width=5,
+                               bg=COLORS['bg_medium'], fg=COLORS['text_gray'])
+            val_lbl.pack(side='left')
+            self.prob_bars[label] = {'canvas': canvas, 'val': val_lbl,
+                                     'color': emotion_colors[label]}
+
     def _create_bottom_bar(self, parent):
         """Create bottom bar with buttons and metrics."""
         bottom_bar = tk.Frame(parent, bg=COLORS['bg_dark'])
@@ -565,14 +593,12 @@ class CalibrationDemoApp:
             self._temp_baseline.neutral_embedding = avg_embedding
             self._temp_baseline.neutral_valence = avg_valence
             self._temp_baseline.neutral_arousal = avg_arousal
+            # Store per-frame valences for V-A variance computation
+            self._neutral_valences = valences
         elif state_name == 'happy':
             self._temp_baseline.happy_embedding = avg_embedding
             self._temp_baseline.happy_valence = avg_valence
             self._temp_baseline.happy_arousal = avg_arousal
-        elif state_name == 'calm':
-            self._temp_baseline.calm_embedding = avg_embedding
-            self._temp_baseline.calm_valence = avg_valence
-            self._temp_baseline.calm_arousal = avg_arousal
 
         # Move to next state
         self.calibration_state_idx += 1
@@ -589,6 +615,34 @@ class CalibrationDemoApp:
 
         # Set baseline for detector
         self.detector.set_baseline(self._temp_baseline)
+
+        # Compute 2-state adaptive thresholds from inter-baseline similarity
+        neutral_emb = self._temp_baseline.neutral_embedding
+        happy_emb = self._temp_baseline.happy_embedding
+        if neutral_emb is not None and happy_emb is not None:
+            sim_nh = cosine_similarity(neutral_emb, happy_emb)
+
+            # V-A adaptive thresholds from neutral capture variance
+            # A user with stable V-A gets tight thresholds; noisy V-A gets loose ones
+            neutral_v_std = float(np.std(self._neutral_valences)) if hasattr(self, '_neutral_valences') else 0.08
+            va_strong = -(max(0.08, neutral_v_std) * 3)    # ~3 sigma, overrides calibration
+            va_moderate = -(max(0.08, neutral_v_std) * 2)  # ~2 sigma, after calibration miss
+
+            thresholds = {
+                'similarity_threshold': max(0.65, min(0.95, sim_nh * 0.85)),
+                'neutral_threshold': max(0.65, min(0.95, sim_nh * 0.87)),
+                'deviation_floor': max(0.50, min(0.90, sim_nh * 0.78)),
+                'raw_override_confidence': 0.60,
+                'va_strong_threshold': va_strong,
+                'va_moderate_threshold': va_moderate,
+            }
+            self.detector.set_adaptive_thresholds(thresholds)
+            print(f"[Adaptive Thresholds] sim_neutral_happy={sim_nh:.3f}")
+            print(f"  similarity={thresholds['similarity_threshold']:.3f} "
+                  f"neutral={thresholds['neutral_threshold']:.3f} "
+                  f"floor={thresholds['deviation_floor']:.3f}")
+            print(f"  V-A: neutral_v_std={neutral_v_std:.3f} "
+                  f"strong={va_strong:.3f} moderate={va_moderate:.3f}")
 
         # Re-enable buttons
         self.calibrate_btn.config(state='normal')
@@ -640,6 +694,21 @@ class CalibrationDemoApp:
         self.detector.set_baseline(baseline)
         self._temp_baseline = baseline
 
+        # Compute 2-state adaptive thresholds from loaded baselines
+        neutral_emb = baseline.neutral_embedding
+        happy_emb = baseline.happy_embedding
+        if neutral_emb is not None and happy_emb is not None:
+            sim_nh = cosine_similarity(neutral_emb, happy_emb)
+            thresholds = {
+                'similarity_threshold': max(0.65, min(0.95, sim_nh * 0.85)),
+                'neutral_threshold': max(0.65, min(0.95, sim_nh * 0.87)),
+                'deviation_floor': max(0.50, min(0.90, sim_nh * 0.78)),
+                'raw_override_confidence': 0.60,
+            }
+            self.detector.set_adaptive_thresholds(thresholds)
+            print(f"[Loaded Profile] Adaptive thresholds: sim_nh={sim_nh:.3f} "
+                  f"threshold={thresholds['similarity_threshold']:.3f}")
+
         self.status_label.config(text=f"Loaded profile for '{user_id}'")
         self.save_btn.config(state='normal')
 
@@ -688,8 +757,11 @@ class CalibrationDemoApp:
             source = calibrated.get('emotion_source', 'unknown')
             source_labels = {
                 'calibration': '[CAL]',
+                'va_override': '[V-A!]',
                 'va_shift': '[V-A]',
-                'raw_model': '[RAW]'
+                'raw_model': '[RAW]',
+                'fallback': '[FB]',
+                'deviation_fallback': '[DEV]',
             }
             source_label = source_labels.get(source, '[?]')
             self.cal_confidence_label.config(
@@ -729,12 +801,25 @@ class CalibrationDemoApp:
                 self.sim_bars[state]['canvas'].delete('all')
                 self.sim_bars[state]['label'].config(text="--")
 
+        # Update probability bars
+        probs = raw.get('emotion_probs', {})
+        for label, bars in self.prob_bars.items():
+            p = probs.get(label, 0.0)
+            bars['canvas'].delete('all')
+            bw = max(0, min(140, int(140 * p)))
+            if bw > 0:
+                bars['canvas'].create_rectangle(0, 0, bw, 14, fill=bars['color'], outline='')
+            bars['val'].config(text=f"{p:.0%}")
+
     def show_no_face(self):
         """Show no face detected state."""
         self.raw_emotion_label.config(text="NO FACE")
         self.raw_confidence_label.config(text="Confidence: --")
         self.cal_emotion_label.config(text="NO FACE")
         self.cal_confidence_label.config(text="Confidence: --")
+        for bars in self.prob_bars.values():
+            bars['canvas'].delete('all')
+            bars['val'].config(text="--")
 
     def update_metrics(self):
         """Update latency and FPS display."""
