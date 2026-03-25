@@ -2,7 +2,8 @@
 DeepFace Emotion Embedding Calibration Demo
 
 Uses 1024-dim embeddings from DeepFace's EMOTION model (not identity model)
-for multi-baseline calibration (neutral, happy, calm).
+for two-state calibration (neutral + happy). Probs come from DeepFace's full
+pipeline; embeddings from the penultimate Dense(1024) layer.
 
 Usage:
     python demos/deepface_emb_demo.py --camera 1
@@ -23,7 +24,7 @@ from core import (
     GenericCalibrationManager,
     GenericCalibratedDetector,
     average_embeddings,
-    compute_adaptive_thresholds,
+    cosine_similarity,
 )
 
 
@@ -57,13 +58,16 @@ COLORS = {
 # ============================================================================
 
 class FaceDetector:
+    """Haar cascade for reliable face detection + bounding box."""
     def __init__(self):
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         self.cascade = cv2.CascadeClassifier(cascade_path)
 
     def detect(self, frame):
+        """Detect largest face. Returns BGR crop and bbox, or (None, None)."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        faces = self.cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
         if len(faces) == 0:
             return None, None
         areas = [w * h for (x, y, w, h) in faces]
@@ -72,8 +76,8 @@ class FaceDetector:
         margin = int(0.1 * w)
         x1, y1 = max(0, x - margin), max(0, y - margin)
         x2, y2 = min(frame.shape[1], x + w + margin), min(frame.shape[0], y + h + margin)
-        face_rgb = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-        return face_rgb, (x1, y1, x2, y2)
+        face_bgr = frame[y1:y2, x1:x2].copy()
+        return face_bgr, (x1, y1, x2, y2)
 
 
 # ============================================================================
@@ -101,12 +105,16 @@ class DeepFaceDemoApp:
         self.captured_frames: List[Dict] = []
         self._temp_baseline: Optional[GenericBaseline] = None
 
-        # Prediction smoothing (reduce fluctuations)
-        self.prediction_history: List[str] = []
+        # Prediction smoothing (applied symmetrically to raw and calibrated)
+        self.raw_history: List[str] = []
+        self.cal_history: List[str] = []
         self.smoothing_window = 5
-        self.current_smoothed_emotion = "Neutral"
+        self.current_raw_smoothed = "Neutral"
+        self.current_cal_smoothed = "Neutral"
 
-        # (No embedding smoothing — emotion embeddings should be more discriminative)
+        # No-face grace period (hold last result for a few frames before showing NO FACE)
+        self.no_face_count = 0
+        self.no_face_grace = 3  # frames
 
         # Metrics
         self.inference_time = 0.0
@@ -117,7 +125,7 @@ class DeepFaceDemoApp:
         # GUI
         self.root = tk.Tk()
         self.root.title("DeepFace Emotion Embedding Calibration - Raw vs Calibrated")
-        self.root.geometry("1100x700")
+        self.root.geometry("1100x820")
         self.root.configure(bg=COLORS['bg_dark'])
         self._setup_ui()
 
@@ -224,6 +232,31 @@ class DeepFaceDemoApp:
 
             self.sim_bars[state] = {'canvas': bar_bg, 'label': val_label, 'color': color}
 
+        # Raw probability bars
+        prob_frame = tk.Frame(right, bg=COLORS['bg_medium'])
+        prob_frame.pack(fill='x', pady=(15, 0))
+
+        tk.Label(prob_frame, text="RAW PROBABILITIES", font=('Helvetica', 10, 'bold'),
+                 bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 4))
+
+        emotion_colors = {
+            'Anger': '#E74C3C', 'Disgust': '#8E44AD', 'Fear': '#9B59B6',
+            'Happiness': '#F1C40F', 'Sadness': '#3498DB', 'Surprise': '#E67E22',
+            'Neutral': '#95A5A6',
+        }
+        self.prob_bars = {}
+        for label in ['Anger', 'Disgust', 'Fear', 'Happiness', 'Sadness', 'Surprise', 'Neutral']:
+            row = tk.Frame(prob_frame, bg=COLORS['bg_medium'])
+            row.pack(fill='x', pady=1)
+            tk.Label(row, text=label[:8], font=('Helvetica', 9), width=10, anchor='e',
+                     bg=COLORS['bg_medium'], fg=COLORS['text_gray']).pack(side='left')
+            canvas = tk.Canvas(row, width=140, height=14, bg='#1e293b', highlightthickness=0)
+            canvas.pack(side='left', padx=(8, 2))
+            val_lbl = tk.Label(row, text="--", font=('Helvetica', 8), width=5,
+                               bg=COLORS['bg_medium'], fg=COLORS['text_gray'])
+            val_lbl.pack(side='left')
+            self.prob_bars[label] = {'canvas': canvas, 'val': val_lbl, 'color': emotion_colors[label]}
+
         # Bottom bar
         bottom = tk.Frame(main, bg=COLORS['bg_dark'])
         bottom.pack(fill='x', pady=(10, 0))
@@ -303,12 +336,38 @@ class DeepFaceDemoApp:
 
         self._temp_baseline.add_state(state['name'], avg_emb)
 
-        # Store individual frame embeddings for variance computation
-        self._cal_frame_embeddings = embeddings
-
         self.cal_state_idx += 1
         self.captured_frames = []
         self.root.after(500, self._start_state_capture)
+
+    def _compute_two_state_thresholds(self, neutral_emb, happy_emb):
+        """Compute thresholds from a single inter-baseline similarity.
+
+        For 2 states, the only signal is cosine(neutral, happy).
+        - similarity_threshold: must beat this to match a baseline
+        - neutral_threshold: slightly stricter for neutral (avoid false neutrals)
+        - deviation_floor: below this, user is far from both baselines
+        """
+        sim_nh = cosine_similarity(neutral_emb, happy_emb)
+
+        # Threshold set relative to how close the two baselines are.
+        # If baselines are very similar (sim ~0.99), thresholds must be strict.
+        # If baselines are well-separated (sim ~0.80), thresholds can be looser.
+        similarity_threshold = max(0.65, min(0.95, sim_nh * 0.85))
+        neutral_threshold = max(0.65, min(0.95, sim_nh * 0.87))
+        deviation_floor = max(0.50, min(0.90, sim_nh * 0.78))
+
+        print(f"[2-State Thresholds] sim_neutral_happy={sim_nh:.3f}")
+        print(f"  similarity={similarity_threshold:.3f} "
+              f"neutral={neutral_threshold:.3f} "
+              f"floor={deviation_floor:.3f}")
+
+        return {
+            'similarity_threshold': similarity_threshold,
+            'neutral_threshold': neutral_threshold,
+            'deviation_floor': deviation_floor,
+            'raw_override_confidence': 0.60,
+        }
 
     def _complete_calibration(self):
         self.cal_in_progress = False
@@ -316,17 +375,10 @@ class DeepFaceDemoApp:
         self.instruction_label.config(text="")
         self.detector.set_baseline(self._temp_baseline)
 
-        # Compute adaptive thresholds (use neutral as calm stand-in)
         neutral_emb = self._temp_baseline.get_embedding('neutral')
         happy_emb = self._temp_baseline.get_embedding('happy')
-        thresholds = compute_adaptive_thresholds(neutral_emb, happy_emb, neutral_emb)
+        thresholds = self._compute_two_state_thresholds(neutral_emb, happy_emb)
         self.detector.set_adaptive_thresholds(thresholds)
-        diag = thresholds['diagnostics']
-        print(f"[Adaptive Thresholds] sim={thresholds['similarity_threshold']:.3f} "
-              f"neutral={thresholds['neutral_threshold']:.3f} "
-              f"floor={thresholds['deviation_floor']:.3f}")
-        print(f"  Pairwise: NH={diag['sim_neutral_happy']:.3f} "
-              f"NC={diag['sim_neutral_calm']:.3f} HC={diag['sim_happy_calm']:.3f}")
 
         self.cal_btn.config(state='normal')
         self.load_btn.config(state='normal')
@@ -358,11 +410,11 @@ class DeepFaceDemoApp:
         self.detector.set_baseline(baseline)
         self._temp_baseline = baseline
 
-        # Compute adaptive thresholds from loaded baselines
+        # Compute 2-state thresholds from loaded baselines
         neutral_emb = baseline.get_embedding('neutral')
         happy_emb = baseline.get_embedding('happy')
         if neutral_emb is not None and happy_emb is not None:
-            thresholds = compute_adaptive_thresholds(neutral_emb, happy_emb, neutral_emb)
+            thresholds = self._compute_two_state_thresholds(neutral_emb, happy_emb)
             self.detector.set_adaptive_thresholds(thresholds)
 
         self.save_btn.config(state='normal')
@@ -385,25 +437,25 @@ class DeepFaceDemoApp:
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
-    def _smooth_emotion(self, emotion: str) -> str:
-        """Smooth predictions over a window to reduce flickering."""
-        self.prediction_history.append(emotion)
-        if len(self.prediction_history) > self.smoothing_window:
-            self.prediction_history = self.prediction_history[-self.smoothing_window:]
-
-        # Majority vote
+    def _smooth_emotion(self, emotion: str, history: List[str], attr: str) -> str:
+        """Majority-vote smoothing. Applied symmetrically to raw and calibrated."""
         from collections import Counter
-        counts = Counter(self.prediction_history)
-        most_common, count = counts.most_common(1)[0]
-
-        # Require majority (>50%) to change
-        if count > len(self.prediction_history) / 2:
-            self.current_smoothed_emotion = most_common
-
-        return self.current_smoothed_emotion
+        history.append(emotion)
+        if len(history) > self.smoothing_window:
+            del history[:-self.smoothing_window]
+        counts = Counter(history)
+        best, count = counts.most_common(1)[0]
+        current = getattr(self, attr)
+        if count > len(history) / 2:
+            current = best
+            setattr(self, attr, current)
+        return current
 
     def update_comparison(self, raw: Dict, calibrated: Dict):
-        self.raw_emotion.config(text=raw['emotion'])
+        # Smooth raw output (same treatment as calibrated)
+        raw_smoothed = self._smooth_emotion(
+            raw['emotion'], self.raw_history, 'current_raw_smoothed')
+        self.raw_emotion.config(text=raw_smoothed)
         self.raw_confidence.config(text=f"Confidence: {raw['confidence']:.0%}")
 
         if calibrated.get('calibrated'):
@@ -411,14 +463,10 @@ class DeepFaceDemoApp:
             tag = {'calibration': '[CAL]', 'raw_model': '[RAW]', 'fallback': '[FB]',
                    'deviation_fallback': '[DEV]'}.get(source, f'[{source}]')
 
-            # Apply smoothing to reduce flickering
-            raw_cal_emotion = calibrated['emotion']
-            smoothed = self._smooth_emotion(raw_cal_emotion)
-            self.cal_emotion.config(text=smoothed)
-
-            # Show both smoothed and instant prediction
-            smooth_note = f" ({raw_cal_emotion})" if raw_cal_emotion != smoothed else ""
-            self.cal_confidence.config(text=f"Confidence: {calibrated['confidence']:.0%} {tag}{smooth_note}")
+            cal_smoothed = self._smooth_emotion(
+                calibrated['emotion'], self.cal_history, 'current_cal_smoothed')
+            self.cal_emotion.config(text=cal_smoothed)
+            self.cal_confidence.config(text=f"Confidence: {calibrated['confidence']:.0%} {tag}")
 
             sims = calibrated.get('similarities', {})
             closest = calibrated.get('closest_baseline', '')
@@ -445,15 +493,66 @@ class DeepFaceDemoApp:
                 self.sim_bars[state]['canvas'].delete('all')
                 self.sim_bars[state]['label'].config(text="--")
 
+        # Update probability bars
+        probs = raw.get('emotion_probs', {})
+        for label, bars in self.prob_bars.items():
+            p = probs.get(label, 0.0)
+            bars['canvas'].delete('all')
+            bw = max(0, min(140, int(140 * p)))
+            if bw > 0:
+                bars['canvas'].create_rectangle(0, 0, bw, 14, fill=bars['color'], outline='')
+            bars['val'].config(text=f"{p:.0%}")
+
     def show_no_face(self):
         self.raw_emotion.config(text="NO FACE")
         self.raw_confidence.config(text="--")
         self.cal_emotion.config(text="NO FACE")
         self.cal_confidence.config(text="--")
+        for bars in self.prob_bars.values():
+            bars['canvas'].delete('all')
+            bars['val'].config(text="--")
 
     # ========================================================================
     # Main Loop
     # ========================================================================
+
+    def _analyze_face(self, face_bgr):
+        """Get probs from DeepFace's full pipeline + embedding from our sub-model.
+
+        Haar cascade detects and crops the face. Then:
+        - DeepFace.analyze(crop, skip) gives probs through the full preprocessing pipeline
+        - Our sub-model gives the 1024-dim embedding for calibration
+        """
+        # Emotion probs via DeepFace's full pipeline (resize, pad, normalize)
+        analysis = self.extractor._deepface.analyze(
+            face_bgr, actions=['emotion'],
+            detector_backend='skip',
+            enforce_detection=False,
+            silent=True,
+        )
+        raw_probs = analysis[0]['emotion']
+        emotion_probs = {
+            'Anger': raw_probs.get('angry', 0.0) / 100,
+            'Disgust': raw_probs.get('disgust', 0.0) / 100,
+            'Fear': raw_probs.get('fear', 0.0) / 100,
+            'Happiness': raw_probs.get('happy', 0.0) / 100,
+            'Sadness': raw_probs.get('sad', 0.0) / 100,
+            'Surprise': raw_probs.get('surprise', 0.0) / 100,
+            'Neutral': raw_probs.get('neutral', 0.0) / 100,
+        }
+
+        # 1024-dim embedding via our sub-model
+        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        preprocessed = self.extractor._preprocess(face_rgb)
+        embedding = self.extractor._embedding_model.predict(preprocessed, verbose=0)[0]
+
+        top_emotion = max(emotion_probs, key=emotion_probs.get)
+        return {
+            'embedding': embedding,
+            'emotion_probs': emotion_probs,
+            'top_emotion': top_emotion,
+            'confidence': emotion_probs[top_emotion],
+        }
 
     def main_loop(self):
         while self.running:
@@ -467,11 +566,12 @@ class DeepFaceDemoApp:
                     time.sleep(0.01)
                     continue
 
-                face_img, bbox = self.face_detector.detect(frame)
+                face_bgr, bbox = self.face_detector.detect(frame)
 
-                if face_img is not None:
+                if face_bgr is not None:
+                    self.no_face_count = 0
                     start = time.time()
-                    result = self.extractor.extract(face_img)
+                    result = self._analyze_face(face_bgr)
                     self.inference_time = time.time() - start
 
                     if self.cal_in_progress:
@@ -483,8 +583,11 @@ class DeepFaceDemoApp:
                     self.root.after(0, lambda f=frame.copy(), b=bbox: self.update_video(f, b))
                     self.root.after(0, lambda r=raw, c=calibrated: self.update_comparison(r, c))
                 else:
+                    self.no_face_count += 1
                     self.root.after(0, lambda f=frame.copy(): self.update_video(f, None))
-                    self.root.after(0, self.show_no_face)
+                    # Only show NO FACE after grace period (avoids flicker on brief drops)
+                    if self.no_face_count >= self.no_face_grace:
+                        self.root.after(0, self.show_no_face)
 
                 # FPS
                 self.frame_count += 1
@@ -514,20 +617,21 @@ class DeepFaceDemoApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         def init():
-            self.status_label.config(text="Loading DeepFace model...")
-            self.root.update()
+            self.root.after(0, lambda: self.status_label.config(
+                text="Loading DeepFace model..."))
             self.extractor.load(status_callback=lambda msg: self.root.after(
-                0, lambda: self.status_label.config(text=msg)))
+                0, lambda m=msg: self.status_label.config(text=m)))
 
-            self.status_label.config(text=f"Starting camera {self.camera_index}...")
-            self.root.update()
+            self.root.after(0, lambda: self.status_label.config(
+                text=f"Starting camera {self.camera_index}..."))
             self.cap = cv2.VideoCapture(self.camera_index)
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             time.sleep(0.5)
 
             self.running = True
-            self.status_label.config(text="Ready! Click 'Calibrate' to start.")
+            self.root.after(0, lambda: self.status_label.config(
+                text="Ready! Click 'Calibrate' to start."))
 
             threading.Thread(target=self.main_loop, daemon=True).start()
 

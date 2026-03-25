@@ -647,14 +647,20 @@ class DeepFaceEmotionEmbeddingExtractor(BaseEmotionExtractor):
             status_callback("DeepFace emotion embedding model loaded!")
 
     def _preprocess(self, face_image):
-        """Preprocess face image for emotion model: RGB → grayscale → 48x48."""
+        """Preprocess face image for emotion model: RGB → grayscale → 48x48 → [0,1].
+
+        DeepFace normalizes pixels to 0-1 range in its pipeline (preprocessing.resize_image).
+        Without this, the model receives 0-255 values and produces degenerate outputs.
+        """
         import cv2
         if len(face_image.shape) == 3:
             gray = cv2.cvtColor(face_image, cv2.COLOR_RGB2GRAY)
         else:
             gray = face_image
         gray = cv2.resize(gray, (48, 48))
-        return np.expand_dims(np.expand_dims(gray, axis=-1), axis=0).astype(np.float32)
+        img = np.expand_dims(np.expand_dims(gray, axis=-1), axis=0).astype(np.float32)
+        img /= 255.0
+        return img
 
     def extract(self, face_image) -> Dict:
         if self._embedding_model is None:
