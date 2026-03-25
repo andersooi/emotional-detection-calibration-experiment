@@ -1,17 +1,23 @@
 """
-DeepFace Logit-Space Calibration Prototype
+DeepFace Neutral/Smile Calibration Demo
 
-Instead of cosine similarity on embeddings, calibrates in the model's
-own decision space by correcting user-specific logit biases.
+Calibrates the neutral-to-positive boundary using a scalar smile score:
+    score = log(p_happy) - log(p_neutral)
 
-Key idea:
-    b_user = z_user_neutral - z_ref_neutral  (user's neutral bias)
-    z_corrected = z_live - alpha * b_user     (bias-corrected logits)
-    p_corrected = softmax(z_corrected)        (corrected probabilities)
+This collapses the 7-class problem into a 1-D decision where the signal
+actually lives. Positive score = more happy, negative = more neutral.
 
-Logits are extracted via log(p + eps) from DeepFace's emotion probabilities,
-which is equivalent to true pre-softmax logits up to an additive constant
-(softmax is shift-invariant, so this constant cancels out).
+Calibration captures two states:
+  1. Neutral face -> establishes the user's resting-face score
+  2. Subtle smile -> establishes the user's mild-positive score
+
+If the two scores separate sufficiently, thresholds are set from the data.
+At inference:
+  - score >= smile_threshold  -> Happiness (calibration override)
+  - score <= neutral_threshold -> Neutral  (calibration override)
+  - otherwise                  -> raw DeepFace (ambiguous zone)
+
+Non-neutral/non-happy emotions (anger, sadness, etc.) always use raw DeepFace.
 
 Usage:
     python demos/deepface_logit_demo.py --camera 1
@@ -43,14 +49,19 @@ EMOTION_COLORS = {
     'Neutral': '#95A5A6',
 }
 
-FRAMES_TO_AVERAGE = 25
-CALIBRATION_DURATION = 5  # seconds
+HAPPY_IDX = EMOTION_LABELS.index('Happiness')
+NEUTRAL_IDX = EMOTION_LABELS.index('Neutral')
 
-# Hand-crafted reference: what DeepFace "should" output for a clearly neutral face.
-# This is the anchor point for bias computation. The user's neutral face is compared
-# against this to determine how much their resting face deviates from "ideal neutral."
-# Order matches EMOTION_LABELS: Anger, Disgust, Fear, Happiness, Sadness, Surprise, Neutral
-REFERENCE_NEUTRAL_PROBS = np.array([0.02, 0.01, 0.02, 0.03, 0.05, 0.02, 0.85])
+FRAMES_TO_AVERAGE = 25
+
+CALIBRATION_STATES = [
+    {'name': 'neutral', 'label': 'Neutral', 'duration': 5,
+     'instruction': 'Look at the camera with a relaxed, natural expression.\n'
+                    'This captures your resting-face baseline.'},
+    {'name': 'subtle_smile', 'label': 'Subtle Smile', 'duration': 5,
+     'instruction': 'Show a gentle, natural smile — not a big grin.\n'
+                    'Think of something mildly pleasant.'},
+]
 
 COLORS = {
     'bg_dark': '#2C3E50',
@@ -65,75 +76,102 @@ COLORS = {
 
 
 # ============================================================================
-# Logit Utilities
+# Smile Score
 # ============================================================================
 
-def probs_to_logits(probs: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Convert probabilities to pseudo-logits via log transform.
+def smile_score_from_probs(probs: np.ndarray, eps: float = 1e-4) -> float:
+    """Compute smile score as log-odds ratio: log(p_happy / p_neutral).
 
-    Equivalent to true pre-softmax logits up to an additive constant,
-    which doesn't matter since softmax is shift-invariant.
+    Positive = face looks more happy than neutral.
+    Negative = face looks more neutral than happy.
+    Zero = equal probability.
     """
-    return np.log(np.clip(probs, eps, None))
+    return float(np.log(probs[HAPPY_IDX] + eps) - np.log(probs[NEUTRAL_IDX] + eps))
 
 
-def softmax(logits: np.ndarray) -> np.ndarray:
-    """Numerically stable softmax."""
-    e = np.exp(logits - np.max(logits))
-    return e / e.sum()
+# ============================================================================
+# Calibrator
+# ============================================================================
 
+class NeutralSmileCalibrator:
+    """Calibrates the neutral/smile boundary from captured probability distributions.
 
-class LogitCalibrator:
-    """
-    Calibrates DeepFace by correcting user-specific logit biases.
-
-    During calibration: captures neutral face -> computes mean logit vector.
-    At inference: subtracts scaled bias from live logits -> re-applies softmax.
-
-    The bias is the difference between the user's neutral logits and a
-    hand-crafted reference neutral distribution (85% neutral, small residuals).
+    Computes smile_score for each calibration frame, then sets thresholds
+    based on the separation between neutral and smile score distributions.
     """
 
-    def __init__(self, alpha: float = 0.7):
-        self.alpha = alpha
-        self.z_ref_neutral: Optional[np.ndarray] = None
-        self.z_user_neutral: Optional[np.ndarray] = None
-        self.b_user: Optional[np.ndarray] = None
-        self.calibrated = False
+    def __init__(self):
+        self.valid = False
+        self.neutral_mean: Optional[float] = None
+        self.neutral_std: Optional[float] = None
+        self.smile_mean: Optional[float] = None
+        self.smile_std: Optional[float] = None
+        self.neutral_threshold: Optional[float] = None
+        self.smile_threshold: Optional[float] = None
+        self.gap: Optional[float] = None
 
-    def set_reference(self, ref_probs: np.ndarray):
-        """Set reference neutral template from probabilities."""
-        self.z_ref_neutral = probs_to_logits(ref_probs)
+    def calibrate(self, neutral_probs_list: List[np.ndarray],
+                  smile_probs_list: List[np.ndarray]) -> Dict:
+        """Compute thresholds from captured calibration data.
 
-    def calibrate(self, user_neutral_logits: np.ndarray):
-        """Set user's neutral logit vector and compute bias."""
-        self.z_user_neutral = user_neutral_logits
-        if self.z_ref_neutral is not None:
-            self.b_user = self.z_user_neutral - self.z_ref_neutral
-        else:
-            self.b_user = self.z_user_neutral
-        self.calibrated = True
-
-    def correct(self, live_probs: np.ndarray) -> np.ndarray:
-        """Apply bias correction to live probabilities.
-
-        Returns corrected probability distribution (7-dim).
+        Returns diagnostic dict with gap, spread, validity, etc.
         """
-        if not self.calibrated or self.b_user is None:
-            return live_probs
+        neutral_scores = np.array(
+            [smile_score_from_probs(p) for p in neutral_probs_list])
+        smile_scores = np.array(
+            [smile_score_from_probs(p) for p in smile_probs_list])
 
-        z_live = probs_to_logits(live_probs)
-        z_corrected = z_live - self.alpha * self.b_user
-        return softmax(z_corrected)
+        self.neutral_mean = float(neutral_scores.mean())
+        self.neutral_std = float(neutral_scores.std())
+        self.smile_mean = float(smile_scores.mean())
+        self.smile_std = float(smile_scores.std())
 
-    def get_bias_info(self) -> Dict[str, float]:
-        """Get the computed bias vector as a labeled dict."""
-        if self.b_user is None:
-            return {}
+        self.gap = self.smile_mean - self.neutral_mean
+        spread = max(0.05, self.neutral_std, self.smile_std)
+        midpoint = (self.neutral_mean + self.smile_mean) / 2
+
+        self.neutral_threshold = midpoint - spread
+        self.smile_threshold = midpoint + spread
+
+        # Valid only if the two states actually separate
+        self.valid = self.gap > max(0.20, 2 * spread)
+
         return {
-            label: float(self.b_user[i])
-            for i, label in enumerate(EMOTION_LABELS)
+            'gap': self.gap,
+            'spread': spread,
+            'midpoint': midpoint,
+            'valid': self.valid,
+            'neutral_mean': self.neutral_mean,
+            'neutral_std': self.neutral_std,
+            'smile_mean': self.smile_mean,
+            'smile_std': self.smile_std,
+            'neutral_threshold': self.neutral_threshold,
+            'smile_threshold': self.smile_threshold,
         }
+
+    def classify(self, score: float, raw_top: str) -> tuple:
+        """Classify based on smile score.
+
+        Returns (label, source) where source is one of:
+            'smile_cal', 'neutral_cal', 'raw_ambiguous', 'raw_non_target', 'raw'
+
+        Calibration only overrides when raw DeepFace already says Neutral or
+        Happiness. All other emotions (anger, sadness, surprise, etc.) pass
+        through untouched — calibration never erases non-target emotions.
+        """
+        if not self.valid:
+            return raw_top, 'raw'
+
+        # Only override at the neutral/happiness boundary
+        if raw_top not in ('Neutral', 'Happiness'):
+            return raw_top, 'raw_non_target'
+
+        if score >= self.smile_threshold:
+            return 'Happiness', 'smile_cal'
+        elif score <= self.neutral_threshold:
+            return 'Neutral', 'neutral_cal'
+        else:
+            return raw_top, 'raw_ambiguous'
 
 
 # ============================================================================
@@ -146,7 +184,7 @@ class FaceDetector:
         self.cascade = cv2.CascadeClassifier(cascade_path)
 
     def detect(self, frame):
-        """Detect largest face and return BGR crop (matching DeepFace's expected input)."""
+        """Detect largest face and return BGR crop (matching DeepFace input)."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self.cascade.detectMultiScale(
             gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
@@ -163,11 +201,11 @@ class FaceDetector:
 
 
 # ============================================================================
-# DeepFace Wrapper (logit-focused)
+# DeepFace Extractor
 # ============================================================================
 
-class DeepFaceLogitExtractor:
-    """Extracts emotion probabilities and logits from DeepFace."""
+class DeepFaceExtractor:
+    """Extracts emotion probabilities from DeepFace."""
 
     def __init__(self, detector_backend='skip'):
         self.detector_backend = detector_backend
@@ -176,10 +214,8 @@ class DeepFaceLogitExtractor:
     def load(self, status_callback=None):
         if status_callback:
             status_callback("Loading DeepFace...")
-
         from deepface import DeepFace
         self._deepface = DeepFace
-
         # Warm up
         dummy = np.zeros((224, 224, 3), dtype=np.uint8)
         try:
@@ -188,22 +224,19 @@ class DeepFaceLogitExtractor:
                 detector_backend='skip', enforce_detection=False)
         except Exception:
             pass
-
         if status_callback:
             status_callback("DeepFace loaded!")
 
     def extract(self, face_image) -> Dict:
-        """Extract emotion probabilities and logits from a face image."""
+        """Extract emotion probabilities from a BGR face image."""
         if self._deepface is None:
             self.load()
-
         analysis = self._deepface.analyze(
             face_image, actions=['emotion'],
             detector_backend=self.detector_backend,
             enforce_detection=False
         )
         raw = analysis[0]['emotion']
-
         # Match EMOTION_LABELS order, convert percentages to probabilities
         probs = np.array([
             raw.get('angry', 0.0) / 100,
@@ -214,38 +247,25 @@ class DeepFaceLogitExtractor:
             raw.get('surprise', 0.0) / 100,
             raw.get('neutral', 0.0) / 100,
         ])
-
-        logits = probs_to_logits(probs)
         top_idx = int(np.argmax(probs))
-
         return {
             'probs': probs,
-            'logits': logits,
             'top_emotion': EMOTION_LABELS[top_idx],
             'confidence': float(probs[top_idx]),
         }
-
-    def get_reference_neutral(self) -> np.ndarray:
-        """Return the reference neutral probability distribution.
-
-        Uses a hand-crafted "ideal neutral" where the neutral class dominates.
-        This is the anchor for bias computation — the user's neutral face logits
-        are compared against this to quantify their resting-face bias.
-        """
-        return REFERENCE_NEUTRAL_PROBS.copy()
 
 
 # ============================================================================
 # Main Application
 # ============================================================================
 
-class DeepFaceLogitDemoApp:
-    """GUI for testing logit-space calibration."""
+class DeepFaceSmileDemoApp:
+    """GUI for testing neutral/smile calibration."""
 
     def __init__(self, camera_index: int = 0):
-        self.extractor = DeepFaceLogitExtractor()
+        self.extractor = DeepFaceExtractor()
         self.face_detector = FaceDetector()
-        self.calibrator = LogitCalibrator(alpha=0.7)
+        self.calibrator = NeutralSmileCalibrator()
 
         self.camera_index = camera_index
         self.cap: Optional[cv2.VideoCapture] = None
@@ -254,12 +274,14 @@ class DeepFaceLogitDemoApp:
 
         # Calibration state
         self.cal_in_progress = False
+        self.cal_state_idx = 0
         self.cal_start_time = 0.0
-        self.captured_logits: List[np.ndarray] = []
+        self.captured_probs: Dict[str, List[np.ndarray]] = {
+            'neutral': [], 'subtle_smile': [],
+        }
 
-        # Probability-level EMA smoothing (smooth the signal, not just labels)
-        self.raw_probs_ema: Optional[np.ndarray] = None
-        self.cal_probs_ema: Optional[np.ndarray] = None
+        # EMA smoothing on raw probs (smooth the signal, not just labels)
+        self.probs_ema: Optional[np.ndarray] = None
         self.ema_decay = 0.3  # weight of new frame (lower = smoother)
 
         # Metrics
@@ -270,8 +292,8 @@ class DeepFaceLogitDemoApp:
 
         # GUI
         self.root = tk.Tk()
-        self.root.title("DeepFace Logit-Space Calibration")
-        self.root.geometry("1250x780")
+        self.root.title("DeepFace Neutral/Smile Calibration")
+        self.root.geometry("1200x750")
         self.root.configure(bg=COLORS['bg_dark'])
         self._setup_ui()
 
@@ -282,7 +304,7 @@ class DeepFaceLogitDemoApp:
         # Top bar
         top = tk.Frame(main, bg=COLORS['bg_dark'])
         top.pack(fill='x', pady=(0, 10))
-        tk.Label(top, text="DeepFace Logit-Space Calibration",
+        tk.Label(top, text="DeepFace Neutral/Smile Calibration",
                  font=('Helvetica', 18, 'bold'),
                  bg=COLORS['bg_dark'], fg=COLORS['text_white']).pack(side='left')
         self.user_label = tk.Label(top, text="[No User]",
@@ -290,11 +312,11 @@ class DeepFaceLogitDemoApp:
                                    bg=COLORS['bg_dark'], fg=COLORS['text_gray'])
         self.user_label.pack(side='right')
 
-        # Content: left (camera) + right (analysis)
+        # Content
         content = tk.Frame(main, bg=COLORS['bg_dark'])
         content.pack(fill='both', expand=True, pady=10)
 
-        # Left — camera feed
+        # Left — camera
         left = tk.Frame(content, bg=COLORS['bg_dark'])
         left.pack(side='left', fill='both')
 
@@ -330,7 +352,8 @@ class DeepFaceLogitDemoApp:
 
         raw_box = tk.Frame(comp, bg=COLORS['bg_dark'], padx=10, pady=8)
         raw_box.pack(side='left', fill='both', expand=True, padx=(0, 5))
-        tk.Label(raw_box, text="RAW", font=('Helvetica', 11, 'bold'),
+        tk.Label(raw_box, text="RAW DEEPFACE",
+                 font=('Helvetica', 11, 'bold'),
                  bg=COLORS['bg_dark'], fg=COLORS['accent_red']).pack()
         self.raw_emotion = tk.Label(raw_box, text="--",
                                     font=('Helvetica', 20, 'bold'),
@@ -345,103 +368,80 @@ class DeepFaceLogitDemoApp:
 
         cal_box = tk.Frame(comp, bg=COLORS['bg_dark'], padx=10, pady=8)
         cal_box.pack(side='right', fill='both', expand=True, padx=(5, 0))
-        tk.Label(cal_box, text="CORRECTED", font=('Helvetica', 11, 'bold'),
+        tk.Label(cal_box, text="CALIBRATED",
+                 font=('Helvetica', 11, 'bold'),
                  bg=COLORS['bg_dark'], fg=COLORS['accent_green']).pack()
         self.cal_emotion = tk.Label(cal_box, text="--",
                                     font=('Helvetica', 20, 'bold'),
                                     bg=COLORS['bg_dark'],
                                     fg=COLORS['text_white'])
         self.cal_emotion.pack(pady=5)
-        self.cal_confidence = tk.Label(cal_box, text="--",
-                                       font=('Helvetica', 10),
-                                       bg=COLORS['bg_dark'],
-                                       fg=COLORS['text_gray'])
-        self.cal_confidence.pack()
+        self.cal_source = tk.Label(cal_box, text="--",
+                                   font=('Helvetica', 10),
+                                   bg=COLORS['bg_dark'],
+                                   fg=COLORS['text_gray'])
+        self.cal_source.pack()
 
-        # Probability distribution bars
-        dist = tk.Frame(right, bg=COLORS['bg_medium'])
-        dist.pack(fill='both', expand=True, pady=(5, 5))
+        # Smile score gauge
+        gauge_frame = tk.Frame(right, bg=COLORS['bg_medium'])
+        gauge_frame.pack(fill='x', pady=(5, 8))
 
-        tk.Label(dist, text="PROBABILITY DISTRIBUTIONS",
-                 font=('Helvetica', 10, 'bold'),
-                 bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 6))
-
-        # Header
-        hdr = tk.Frame(dist, bg=COLORS['bg_medium'])
-        hdr.pack(fill='x')
-        tk.Label(hdr, text="", width=10,
-                 bg=COLORS['bg_medium']).pack(side='left')
-        tk.Label(hdr, text="Raw", font=('Helvetica', 9, 'bold'),
-                 width=18, bg=COLORS['bg_medium'],
-                 fg=COLORS['accent_red']).pack(side='left', padx=(8, 0))
-        tk.Label(hdr, text="Corrected", font=('Helvetica', 9, 'bold'),
-                 width=18, bg=COLORS['bg_medium'],
-                 fg=COLORS['accent_green']).pack(side='left', padx=(8, 0))
-
-        self.prob_bars = {}
-        for label in EMOTION_LABELS:
-            row = tk.Frame(dist, bg=COLORS['bg_medium'])
-            row.pack(fill='x', pady=2)
-
-            tk.Label(row, text=label[:8], font=('Helvetica', 9),
-                     width=10, anchor='e',
-                     bg=COLORS['bg_medium'],
-                     fg=COLORS['text_gray']).pack(side='left')
-
-            raw_c = tk.Canvas(row, width=120, height=16,
-                              bg='#1e293b', highlightthickness=0)
-            raw_c.pack(side='left', padx=(8, 2))
-            raw_v = tk.Label(row, text="--", font=('Helvetica', 8),
-                             width=5, bg=COLORS['bg_medium'],
-                             fg=COLORS['text_gray'])
-            raw_v.pack(side='left')
-
-            cal_c = tk.Canvas(row, width=120, height=16,
-                              bg='#1e293b', highlightthickness=0)
-            cal_c.pack(side='left', padx=(8, 2))
-            cal_v = tk.Label(row, text="--", font=('Helvetica', 8),
-                             width=5, bg=COLORS['bg_medium'],
-                             fg=COLORS['text_gray'])
-            cal_v.pack(side='left')
-
-            self.prob_bars[label] = {
-                'raw_canvas': raw_c, 'raw_val': raw_v,
-                'cal_canvas': cal_c, 'cal_val': cal_v,
-            }
-
-        # Bias vector display
-        bias_section = tk.Frame(right, bg=COLORS['bg_medium'])
-        bias_section.pack(fill='x', pady=(5, 5))
-        tk.Label(bias_section, text="BIAS CORRECTION",
+        tk.Label(gauge_frame, text="SMILE SCORE (log-odds)",
                  font=('Helvetica', 10, 'bold'),
                  bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 3))
-        self.bias_label = tk.Label(bias_section, text="[Not calibrated]",
+
+        gauge_row = tk.Frame(gauge_frame, bg=COLORS['bg_medium'])
+        gauge_row.pack(fill='x')
+        tk.Label(gauge_row, text="Neutral", font=('Helvetica', 9),
+                 bg=COLORS['bg_medium'], fg='#95A5A6').pack(side='left')
+        self.gauge_canvas = tk.Canvas(gauge_row, width=300, height=30,
+                                      bg='#1e293b', highlightthickness=0)
+        self.gauge_canvas.pack(side='left', padx=8)
+        tk.Label(gauge_row, text="Smile", font=('Helvetica', 9),
+                 bg=COLORS['bg_medium'], fg='#F1C40F').pack(side='left')
+
+        self.score_label = tk.Label(gauge_frame, text="Score: --",
+                                    font=('Courier', 10),
+                                    bg=COLORS['bg_medium'],
+                                    fg=COLORS['text_white'])
+        self.score_label.pack()
+
+        # Calibration diagnostics
+        diag_frame = tk.Frame(right, bg=COLORS['bg_medium'])
+        diag_frame.pack(fill='x', pady=(5, 8))
+        tk.Label(diag_frame, text="CALIBRATION",
+                 font=('Helvetica', 10, 'bold'),
+                 bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 3))
+        self.diag_label = tk.Label(diag_frame, text="[Not calibrated]",
                                    font=('Courier', 9),
                                    bg=COLORS['bg_medium'],
                                    fg=COLORS['text_gray'],
                                    justify='left', anchor='w')
-        self.bias_label.pack(fill='x')
+        self.diag_label.pack(fill='x')
 
-        # Alpha slider
-        alpha_row = tk.Frame(right, bg=COLORS['bg_medium'])
-        alpha_row.pack(fill='x', pady=(5, 0))
-        tk.Label(alpha_row, text="Alpha:",
-                 font=('Helvetica', 10),
-                 bg=COLORS['bg_medium'],
-                 fg=COLORS['text_white']).pack(side='left')
-        self.alpha_var = tk.DoubleVar(value=0.7)
-        self.alpha_slider = tk.Scale(
-            alpha_row, from_=0.0, to=1.5, resolution=0.05,
-            orient='horizontal', variable=self.alpha_var,
-            command=self._on_alpha_change,
-            bg=COLORS['bg_medium'], fg=COLORS['text_white'],
-            highlightthickness=0, length=200)
-        self.alpha_slider.pack(side='left', padx=10)
-        self.alpha_label = tk.Label(alpha_row, text="0.70",
-                                    font=('Helvetica', 10, 'bold'),
-                                    bg=COLORS['bg_medium'],
-                                    fg=COLORS['accent_blue'])
-        self.alpha_label.pack(side='left')
+        # Raw probability bars (single column — calibration is an overlay, not a new distribution)
+        dist = tk.Frame(right, bg=COLORS['bg_medium'])
+        dist.pack(fill='both', expand=True, pady=(5, 0))
+        tk.Label(dist, text="RAW PROBABILITIES",
+                 font=('Helvetica', 10, 'bold'),
+                 bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 4))
+
+        self.prob_bars = {}
+        for label in EMOTION_LABELS:
+            row = tk.Frame(dist, bg=COLORS['bg_medium'])
+            row.pack(fill='x', pady=1)
+            tk.Label(row, text=label[:8], font=('Helvetica', 9),
+                     width=10, anchor='e',
+                     bg=COLORS['bg_medium'],
+                     fg=COLORS['text_gray']).pack(side='left')
+            canvas = tk.Canvas(row, width=160, height=14,
+                               bg='#1e293b', highlightthickness=0)
+            canvas.pack(side='left', padx=(8, 2))
+            val_lbl = tk.Label(row, text="--", font=('Helvetica', 8),
+                               width=5, bg=COLORS['bg_medium'],
+                               fg=COLORS['text_gray'])
+            val_lbl.pack(side='left')
+            self.prob_bars[label] = {'canvas': canvas, 'val': val_lbl}
 
         # Bottom bar
         bottom = tk.Frame(main, bg=COLORS['bg_dark'])
@@ -471,11 +471,6 @@ class DeepFaceLogitDemoApp:
             fg=COLORS['text_gray'])
         self.metrics_label.pack(side='right')
 
-    def _on_alpha_change(self, val):
-        alpha = float(val)
-        self.calibrator.alpha = alpha
-        self.alpha_label.config(text=f"{alpha:.2f}")
-
     # ========================================================================
     # Calibration
     # ========================================================================
@@ -488,94 +483,132 @@ class DeepFaceLogitDemoApp:
         self.current_user = user_id
         self.user_label.config(text=f"User: {user_id}")
         self.cal_in_progress = True
-        self.captured_logits = []
-        self.cal_start_time = time.time()
+        self.cal_state_idx = 0
+        self.captured_probs = {'neutral': [], 'subtle_smile': []}
+        self._reset_ema()
         self.cal_btn.config(state='disabled')
         self.load_btn.config(state='disabled')
+        self._start_state_capture()
 
+    def _start_state_capture(self):
+        if self.cal_state_idx >= len(CALIBRATION_STATES):
+            self._complete_calibration()
+            return
+        state = CALIBRATION_STATES[self.cal_state_idx]
         self.instruction_label.config(
-            text="Capturing NEUTRAL\n\n"
-                 "Look at the camera with a relaxed, natural expression.\n"
-                 "This captures your resting-face bias for logit correction.")
+            text=f"Capturing {state['label'].upper()}\n\n{state['instruction']}")
         self.progress_bar.pack(pady=5)
         self.progress_var.set(0)
+        self.cal_start_time = time.time()
         self.status_label.config(
-            text=f"Calibrating: Neutral ({CALIBRATION_DURATION}s)")
+            text=f"Calibrating: {state['label']} ({state['duration']}s)")
 
     def _capture_frame_for_calibration(self, result: Dict):
         if not self.cal_in_progress:
             return
+        if self.cal_state_idx >= len(CALIBRATION_STATES):
+            return
+        state = CALIBRATION_STATES[self.cal_state_idx]
         elapsed = time.time() - self.cal_start_time
-        self.progress_var.set(min(100, (elapsed / CALIBRATION_DURATION) * 100))
+        self.progress_var.set(min(100, (elapsed / state['duration']) * 100))
         if elapsed > 1.0:  # skip first second (settling)
-            self.captured_logits.append(result['logits'])
-        if elapsed >= CALIBRATION_DURATION:
-            self._complete_calibration()
+            self.captured_probs[state['name']].append(result['probs'])
+        if elapsed >= state['duration']:
+            self._finalize_state_capture()
+
+    def _finalize_state_capture(self):
+        state = CALIBRATION_STATES[self.cal_state_idx]
+        frames = self.captured_probs[state['name']]
+        if len(frames) < 5:
+            messagebox.showwarning("Retry",
+                                   f"Not enough frames for {state['label']}.")
+            self.cal_start_time = time.time()
+            self.captured_probs[state['name']] = []
+            return
+
+        # Keep last N frames
+        self.captured_probs[state['name']] = frames[-FRAMES_TO_AVERAGE:]
+        self.cal_state_idx += 1
+        self.root.after(500, self._start_state_capture)
 
     def _complete_calibration(self):
         self.cal_in_progress = False
         self.progress_bar.pack_forget()
         self.instruction_label.config(text="")
 
-        if len(self.captured_logits) < 5:
-            messagebox.showwarning("Retry", "Not enough frames captured.")
-            self.cal_btn.config(state='normal')
-            self.load_btn.config(state='normal')
-            return
-
-        # Average logits from last N frames
-        logits_arr = np.array(self.captured_logits[-FRAMES_TO_AVERAGE:])
-        avg_logits = np.mean(logits_arr, axis=0)
-
-        self.calibrator.calibrate(avg_logits)
+        diag = self.calibrator.calibrate(
+            self.captured_probs['neutral'],
+            self.captured_probs['subtle_smile'],
+        )
 
         # Console diagnostics
-        bias = self.calibrator.get_bias_info()
-        print(f"\n[Logit Calibration] alpha={self.calibrator.alpha:.2f}  "
-              f"frames={len(self.captured_logits)}")
-        print(f"  User neutral probs:  "
-              f"{dict(zip(EMOTION_LABELS, softmax(avg_logits)))}")
-        print(f"  Bias vector (positive = reduced, negative = boosted):")
-        for lbl, b in sorted(bias.items(), key=lambda x: abs(x[1]),
-                              reverse=True):
-            print(f"    {lbl:12s}: {b:+.3f}")
+        print(f"\n[Neutral/Smile Calibration]")
+        print(f"  Neutral score: mean={diag['neutral_mean']:.3f} "
+              f"std={diag['neutral_std']:.3f}")
+        print(f"  Smile score:   mean={diag['smile_mean']:.3f} "
+              f"std={diag['smile_std']:.3f}")
+        print(f"  Gap: {diag['gap']:.3f}  Spread: {diag['spread']:.3f}")
+        print(f"  Thresholds: neutral<={diag['neutral_threshold']:.3f}  "
+              f"smile>={diag['smile_threshold']:.3f}")
+        print(f"  Valid: {diag['valid']}")
 
-        # Update GUI bias display
-        self._update_bias_display(bias)
+        # Update GUI diagnostics
+        self._update_diag_display(diag)
 
         self.cal_btn.config(state='normal')
         self.load_btn.config(state='normal')
         self.save_btn.config(state='normal')
-        self.status_label.config(text="Calibration complete!")
-        messagebox.showinfo("Done",
-                            f"Logit calibration complete for '{self.current_user}'.\n"
-                            f"Adjust the Alpha slider to tune correction strength.")
 
-    def _update_bias_display(self, bias: Dict[str, float]):
-        lines = []
-        for lbl, b in sorted(bias.items(), key=lambda x: abs(x[1]),
-                              reverse=True):
-            arrow = "\u2193reduced" if b > 0.01 else (
-                "\u2191boosted" if b < -0.01 else "  ~zero")
-            lines.append(f"  {lbl[:8]:9s}{b:+.3f} {arrow}")
-        self.bias_label.config(text="\n".join(lines))
+        if diag['valid']:
+            self.status_label.config(
+                text="Calibration valid! Showing calibrated output.")
+            messagebox.showinfo(
+                "Done",
+                f"Calibration complete for '{self.current_user}'.\n"
+                f"Gap: {diag['gap']:.3f} — states are separable.")
+        else:
+            self.status_label.config(
+                text="Calibration invalid — states too similar.")
+            messagebox.showwarning(
+                "Weak Calibration",
+                f"Neutral and smile scores are too close "
+                f"(gap={diag['gap']:.3f}).\n"
+                f"Calibration will fall back to raw DeepFace.\n"
+                f"Try a more distinct smile.")
+
+    def _update_diag_display(self, diag: Dict):
+        valid_str = "YES" if diag['valid'] else "NO (insufficient separation)"
+        valid_color = COLORS['accent_green'] if diag['valid'] else COLORS['accent_red']
+        self.diag_label.config(
+            text=f"  Neutral mean:  {diag['neutral_mean']:+.3f}\n"
+                 f"  Smile mean:    {diag['smile_mean']:+.3f}\n"
+                 f"  Gap:           {diag['gap']:.3f}\n"
+                 f"  Neutral thr:  <={diag['neutral_threshold']:+.3f}\n"
+                 f"  Smile thr:    >={diag['smile_threshold']:+.3f}\n"
+                 f"  Valid:          {valid_str}",
+            fg=valid_color)
 
     # ========================================================================
     # Profile persistence
     # ========================================================================
 
     def save_profile(self):
-        if not self.calibrator.calibrated:
+        if self.calibrator.neutral_mean is None:
             messagebox.showwarning("No Calibration", "Nothing to save.")
             return
         import pickle, os
         os.makedirs('./user_profiles', exist_ok=True)
-        filepath = f"./user_profiles/{self.current_user}_logit.pkl"
+        filepath = f"./user_profiles/{self.current_user}_smile.pkl"
         data = {
             'user_id': self.current_user,
-            'z_user_neutral': self.calibrator.z_user_neutral,
-            'z_ref_neutral': self.calibrator.z_ref_neutral,
-            'alpha': self.calibrator.alpha,
+            'neutral_mean': self.calibrator.neutral_mean,
+            'neutral_std': self.calibrator.neutral_std,
+            'smile_mean': self.calibrator.smile_mean,
+            'smile_std': self.calibrator.smile_std,
+            'neutral_threshold': self.calibrator.neutral_threshold,
+            'smile_threshold': self.calibrator.smile_threshold,
+            'gap': self.calibrator.gap,
+            'valid': self.calibrator.valid,
         }
         with open(filepath, 'wb') as f:
             pickle.dump(data, f)
@@ -587,17 +620,17 @@ class DeepFaceLogitDemoApp:
         if not os.path.exists(profiles_dir):
             messagebox.showinfo("No Profiles", "No saved profiles found.")
             return
-        profiles = [f.replace('_logit.pkl', '')
+        profiles = [f.replace('_smile.pkl', '')
                     for f in os.listdir(profiles_dir)
-                    if f.endswith('_logit.pkl')]
+                    if f.endswith('_smile.pkl')]
         if not profiles:
-            messagebox.showinfo("No Profiles", "No logit profiles found.")
+            messagebox.showinfo("No Profiles", "No smile profiles found.")
             return
         user_id = simpledialog.askstring(
             "Load", f"Available: {', '.join(profiles)}\n\nEnter user ID:")
         if not user_id:
             return
-        filepath = f"{profiles_dir}/{user_id}_logit.pkl"
+        filepath = f"{profiles_dir}/{user_id}_smile.pkl"
         if not os.path.exists(filepath):
             messagebox.showwarning("Not Found",
                                    f"Profile '{user_id}' not found.")
@@ -607,15 +640,20 @@ class DeepFaceLogitDemoApp:
             data = pickle.load(f)
         self.current_user = user_id
         self.user_label.config(text=f"User: {user_id}")
-        self.calibrator.z_ref_neutral = data['z_ref_neutral']
-        self.calibrator.calibrate(data['z_user_neutral'])
-        self.calibrator.alpha = data.get('alpha', 0.7)
-        self.alpha_var.set(self.calibrator.alpha)
-        self.alpha_label.config(text=f"{self.calibrator.alpha:.2f}")
+        self._reset_ema()
+        self.calibrator.neutral_mean = data['neutral_mean']
+        self.calibrator.neutral_std = data['neutral_std']
+        self.calibrator.smile_mean = data['smile_mean']
+        self.calibrator.smile_std = data['smile_std']
+        self.calibrator.neutral_threshold = data['neutral_threshold']
+        self.calibrator.smile_threshold = data['smile_threshold']
+        self.calibrator.gap = data['gap']
+        self.calibrator.valid = data['valid']
         self.save_btn.config(state='normal')
+        self._update_diag_display(data)
         self.status_label.config(
-            text=f"Loaded logit profile for '{user_id}'")
-        self._update_bias_display(self.calibrator.get_bias_info())
+            text=f"Loaded profile for '{user_id}' "
+                 f"({'valid' if data['valid'] else 'invalid'})")
 
     # ========================================================================
     # Display
@@ -634,76 +672,131 @@ class DeepFaceLogitDemoApp:
         self.video_label.imgtk = imgtk
         self.video_label.configure(image=imgtk)
 
-    def _ema_smooth(self, new_probs: np.ndarray, ema_attr: str) -> np.ndarray:
-        """Exponential moving average on probability vectors.
-
-        Smooths the distribution itself, not just the argmax label.
-        This gives an honest view of the correction's stability.
-        """
-        prev = getattr(self, ema_attr)
-        if prev is None:
-            smoothed = new_probs.copy()
+    def _ema_smooth(self, new_probs: np.ndarray) -> np.ndarray:
+        """EMA on probability vectors — smooth the signal, not the labels."""
+        if self.probs_ema is None:
+            self.probs_ema = new_probs.copy()
         else:
-            smoothed = self.ema_decay * new_probs + (1 - self.ema_decay) * prev
-        setattr(self, ema_attr, smoothed)
-        return smoothed
+            self.probs_ema = (self.ema_decay * new_probs
+                              + (1 - self.ema_decay) * self.probs_ema)
+        return self.probs_ema
+
+    def _draw_gauge(self, score: float):
+        """Draw the smile score gauge with threshold markers and zones."""
+        self.gauge_canvas.delete('all')
+        w, h = 300, 30
+
+        # Determine display range from calibration data or defaults
+        if self.calibrator.neutral_threshold is not None:
+            lo = min(self.calibrator.neutral_threshold - 1.0, score - 0.5)
+            hi = max(self.calibrator.smile_threshold + 1.0, score + 0.5)
+        else:
+            lo, hi = -6.0, 2.0
+
+        def x_pos(val):
+            return max(0, min(w, int(w * (val - lo) / (hi - lo))))
+
+        # Draw colored zones if calibrated
+        if self.calibrator.neutral_threshold is not None:
+            nt = x_pos(self.calibrator.neutral_threshold)
+            st = x_pos(self.calibrator.smile_threshold)
+            # Neutral zone (left, blue-ish)
+            self.gauge_canvas.create_rectangle(
+                0, 0, nt, h, fill='#2c3e6b', outline='')
+            # Ambiguous zone (middle, gray)
+            self.gauge_canvas.create_rectangle(
+                nt, 0, st, h, fill='#3d3d3d', outline='')
+            # Smile zone (right, warm)
+            self.gauge_canvas.create_rectangle(
+                st, 0, w, h, fill='#4a3e1b', outline='')
+            # Threshold lines
+            self.gauge_canvas.create_line(
+                nt, 0, nt, h, fill='#5b7db1', width=2)
+            self.gauge_canvas.create_line(
+                st, 0, st, h, fill='#b1a05b', width=2)
+
+        # Score marker (white triangle + line)
+        sx = x_pos(score)
+        self.gauge_canvas.create_polygon(
+            sx - 5, 0, sx + 5, 0, sx, 8,
+            fill='#FFFFFF', outline='')
+        self.gauge_canvas.create_line(
+            sx, 8, sx, h, fill='#FFFFFF', width=2)
 
     def update_display(self, result: Dict):
         raw_probs = result['probs']
 
-        # EMA-smooth raw probabilities
-        raw_smooth = self._ema_smooth(raw_probs, 'raw_probs_ema')
-        raw_top_idx = int(np.argmax(raw_smooth))
+        # Single EMA-smoothed distribution drives everything
+        smoothed = self._ema_smooth(raw_probs)
+        raw_top_idx = int(np.argmax(smoothed))
         raw_top = EMOTION_LABELS[raw_top_idx]
-        raw_conf = float(raw_smooth[raw_top_idx])
+        raw_conf = float(smoothed[raw_top_idx])
 
-        # Corrected output (correction applied to per-frame probs, then smoothed)
-        corrected_probs = self.calibrator.correct(raw_probs)
-        cal_smooth = self._ema_smooth(corrected_probs, 'cal_probs_ema')
-        cal_top_idx = int(np.argmax(cal_smooth))
-        cal_top = EMOTION_LABELS[cal_top_idx]
-        cal_conf = float(cal_smooth[cal_top_idx])
+        # Smile score from smoothed probs
+        score = smile_score_from_probs(smoothed)
 
+        # Calibrated decision (overlay on raw)
+        cal_label, source = self.calibrator.classify(score, raw_top)
+
+        # Update emotion labels
         self.raw_emotion.config(text=raw_top)
         self.raw_confidence.config(text=f"{raw_conf:.0%}")
 
-        if self.calibrator.calibrated:
-            self.cal_emotion.config(text=cal_top)
-            self.cal_confidence.config(text=f"{cal_conf:.0%}")
-        else:
-            self.cal_emotion.config(text="[No Cal]")
-            self.cal_confidence.config(text="Calibrate first")
+        source_tags = {
+            'smile_cal': '[SMILE CAL]',
+            'neutral_cal': '[NEUTRAL CAL]',
+            'raw_ambiguous': '[AMBIGUOUS]',
+            'raw_non_target': '[RAW PASS-THRU]',
+            'raw': '[RAW]',
+        }
+        source_colors = {
+            'smile_cal': COLORS['accent_yellow'],
+            'neutral_cal': COLORS['accent_blue'],
+            'raw_ambiguous': COLORS['text_gray'],
+            'raw_non_target': COLORS['accent_red'],
+            'raw': COLORS['text_gray'],
+        }
+        self.cal_emotion.config(
+            text=cal_label,
+            fg=source_colors.get(source, COLORS['text_white']))
+        self.cal_source.config(text=source_tags.get(source, source))
 
-        # Probability bars (show smoothed distributions)
+        # Score display and gauge
+        self.score_label.config(text=f"Score: {score:+.3f}")
+        self._draw_gauge(score)
+
+        # Raw probability bars (smoothed)
         for i, label in enumerate(EMOTION_LABELS):
             bars = self.prob_bars[label]
-            color = EMOTION_COLORS[label]
+            p = float(smoothed[i])
+            bars['canvas'].delete('all')
+            bw = max(0, min(160, int(160 * p)))
+            if bw > 0:
+                bars['canvas'].create_rectangle(
+                    0, 0, bw, 14,
+                    fill=EMOTION_COLORS[label], outline='')
+            bars['val'].config(text=f"{p:.0%}")
 
-            # Raw (smoothed)
-            rp = float(raw_smooth[i])
-            bars['raw_canvas'].delete('all')
-            w = max(0, min(120, int(120 * rp)))
-            if w > 0:
-                bars['raw_canvas'].create_rectangle(
-                    0, 0, w, 16, fill=color, outline='')
-            bars['raw_val'].config(text=f"{rp:.0%}")
+    def _reset_ema(self):
+        """Reset EMA state to prevent stale history from leaking."""
+        self.probs_ema = None
 
-            # Corrected (smoothed)
-            cp = float(cal_smooth[i])
-            bars['cal_canvas'].delete('all')
-            w = max(0, min(120, int(120 * cp)))
-            if w > 0:
-                fill = color if self.calibrator.calibrated else '#475569'
-                bars['cal_canvas'].create_rectangle(
-                    0, 0, w, 16, fill=fill, outline='')
-            bars['cal_val'].config(
-                text=f"{cp:.0%}" if self.calibrator.calibrated else "--")
+    def _clear_display(self):
+        """Clear all live display elements."""
+        self.gauge_canvas.delete('all')
+        for label in EMOTION_LABELS:
+            bars = self.prob_bars[label]
+            bars['canvas'].delete('all')
+            bars['val'].config(text="--")
 
     def show_no_face(self):
+        self._reset_ema()
         self.raw_emotion.config(text="NO FACE")
         self.raw_confidence.config(text="--")
-        self.cal_emotion.config(text="NO FACE")
-        self.cal_confidence.config(text="--")
+        self.cal_emotion.config(text="NO FACE", fg=COLORS['text_white'])
+        self.cal_source.config(text="--")
+        self.score_label.config(text="Score: --")
+        self._clear_display()
 
     # ========================================================================
     # Main Loop
@@ -715,7 +808,6 @@ class DeepFaceLogitDemoApp:
                 if self.cap is None or not self.cap.isOpened():
                     time.sleep(0.1)
                     continue
-
                 ret, frame = self.cap.read()
                 if not ret:
                     time.sleep(0.01)
@@ -780,11 +872,6 @@ class DeepFaceLogitDemoApp:
                 status_callback=lambda msg: self.root.after(
                     0, lambda m=msg: self.status_label.config(text=m)))
 
-            # Set reference neutral template (hand-crafted ideal neutral)
-            ref_probs = self.extractor.get_reference_neutral()
-            self.calibrator.set_reference(ref_probs)
-            print(f"[Reference Neutral] {dict(zip(EMOTION_LABELS, [f'{p:.3f}' for p in ref_probs]))}")
-
             self.root.after(0, lambda: self.status_label.config(
                 text=f"Starting camera {self.camera_index}..."))
             self.cap = cv2.VideoCapture(self.camera_index)
@@ -795,7 +882,6 @@ class DeepFaceLogitDemoApp:
             self.running = True
             self.root.after(0, lambda: self.status_label.config(
                 text="Ready! Click 'Calibrate' to start."))
-
             threading.Thread(target=self.main_loop, daemon=True).start()
 
         threading.Thread(target=init, daemon=True).start()
@@ -805,11 +891,11 @@ class DeepFaceLogitDemoApp:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
-        description='DeepFace Logit-Space Calibration Demo')
+        description='DeepFace Neutral/Smile Calibration Demo')
     parser.add_argument('--camera', type=int, default=0,
                         help='Camera index (0=default, 1=MacBook webcam)')
     args = parser.parse_args()
 
     print(f"Using camera index: {args.camera}")
-    app = DeepFaceLogitDemoApp(camera_index=args.camera)
+    app = DeepFaceSmileDemoApp(camera_index=args.camera)
     app.run()
