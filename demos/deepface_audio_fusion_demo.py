@@ -205,6 +205,10 @@ class DeepFaceAudioFusionApp:
         self.no_face_count = 0
         self.no_face_grace = 3
 
+        # Face EMA smoothing (dampen jitter from mouth movement during speech)
+        self.face_probs_ema: Optional[np.ndarray] = None
+        self.face_ema_decay = 0.3  # weight of new frame (lower = smoother)
+
         # Metrics
         self.face_latency = 0.0
         self.face_fps = 0.0
@@ -467,6 +471,7 @@ class DeepFaceAudioFusionApp:
         self.cal_in_progress = True
         self.cal_state_idx = 0
         self.captured_frames = []
+        self.face_probs_ema = None  # Reset EMA on new calibration
         self.cal_btn.config(state='disabled')
         self.load_btn.config(state='disabled')
         self._start_state_capture()
@@ -788,6 +793,28 @@ class DeepFaceAudioFusionApp:
                     # Build adapted face result for fusion
                     face_for_fusion = build_face_result(raw_pred, cal_pred)
 
+                    # EMA-smooth the probability vector to dampen speech jitter
+                    probs_array = np.array([
+                        face_for_fusion['emotion_probs'].get(em, 0.0)
+                        for em in EMOTION_LABELS])
+                    if self.face_probs_ema is None:
+                        self.face_probs_ema = probs_array.copy()
+                    else:
+                        self.face_probs_ema = (
+                            self.face_ema_decay * probs_array
+                            + (1 - self.face_ema_decay) * self.face_probs_ema)
+                    # Rebuild face_for_fusion with smoothed probs
+                    smoothed_probs = {
+                        em: float(self.face_probs_ema[i])
+                        for i, em in enumerate(EMOTION_LABELS)}
+                    smoothed_top = max(smoothed_probs, key=smoothed_probs.get)
+                    face_for_fusion = {
+                        'top_emotion': smoothed_top,
+                        'confidence': smoothed_probs[smoothed_top],
+                        'emotion_probs': smoothed_probs,
+                        '_face_source': face_for_fusion.get('_face_source', ''),
+                    }
+
                     with self._lock:
                         self._latest_face_for_fusion = face_for_fusion
                         self._latest_face_raw = raw_pred
@@ -803,6 +830,7 @@ class DeepFaceAudioFusionApp:
                         0, lambda f=frame.copy():
                         self.update_video(f, None))
                     if self.no_face_count >= self.no_face_grace:
+                        self.face_probs_ema = None  # Reset EMA
                         with self._lock:
                             self._latest_face_for_fusion = None
                             self._latest_face_raw = None
