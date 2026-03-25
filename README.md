@@ -1,101 +1,83 @@
-# HSEmotion Calibration Test Prototype
+# Emotion Detection with Calibration Experiment
 
-Tests the calibration layer with HSEmotion, showing **raw model output vs calibrated output** side-by-side.
+Real-time multimodal emotion detection prototype for the AIRA elderly care robot. Combines facial and speech emotion models with per-user calibration and late fusion.
+
+## Architecture
+
+```
+Face (webcam) ──> DeepFace (calibrated neutral + happy)
+                         │
+                    Fusion Adapter ──> ProbabilityFusion ──> Fused Emotion
+                         │                                   (Q1-Q4 + Neutral)
+Audio (mic) ───> Emotion2Vec large (raw) ──────────────┘
+                         │
+                    FunASR VAD (speech detection)
+```
+
+- **Visual model**: DeepFace (VGG-Face backbone) — calibrated for neutral/happy via cosine similarity on 1024-dim emotion embeddings
+- **Audio model**: Emotion2Vec large — raw output, no calibration. Strong on sadness (80% on RAVDESS)
+- **Fusion**: V1 Probability Fusion with asymmetric sadness weighting (audio gets 65% weight when it detects Sad but face says Neutral/Happy)
+- **VAD**: FunASR FSMN VAD filters background noise so only speech reaches Emotion2Vec
 
 ## Quick Start
 
 ```bash
 cd calibration_test
 
-# Use the virtual environment (already set up)
-./venv/bin/python calibration_demo.py
+# Main fusion demo (DeepFace + Emotion2Vec)
+PYTHONPATH=. venv/bin/python demos/deepface_audio_fusion_demo.py --camera 1
 
-# Or activate venv first
-source venv/bin/activate
-python calibration_demo.py
+# HSEmotion visual-only demo
+venv/bin/python demos/visual_demo.py --camera 1
+
+# DeepFace embedding calibration demo
+PYTHONPATH=. venv/bin/python demos/deepface_emb_demo.py --camera 1
 ```
 
-## Requirements
-
-A virtual environment is included with all dependencies installed:
-
-- Python 3.8+
-- EmotiEffLib (HSEmotion)
-- OpenCV
-- Pillow
-- NumPy
-
-To recreate the venv if needed:
-```bash
-python3 -m venv venv
-./venv/bin/pip install numpy opencv-python Pillow emotiefflib
-```
-
-## Usage
-
-### 1. Calibration Mode
-
-1. Click **"Calibrate"** button
-2. Enter a user ID (e.g., `test_user`)
-3. Follow the on-screen prompts:
-   - **Neutral** (5 sec): Relaxed, natural expression
-   - **Happy** (5 sec): Think of a happy memory, smile naturally
-   - **Calm** (5 sec): Deep breath, relaxed and peaceful
-4. Click **"Save Profile"** to store calibration
-
-### 2. Detection Mode
-
-After calibration, the GUI shows side-by-side comparison:
-
-| RAW OUTPUT | CALIBRATED OUTPUT |
-|------------|-------------------|
-| Direct model prediction | Adjusted using your baselines |
-| Absolute V-A values | V-A shifts from YOUR neutral |
-| Model's quadrant | Personalized quadrant |
-
-### 3. Loading Profiles
-
-Click **"Load Profile"** to load a previously saved calibration.
-
-## File Structure
+## Project Structure
 
 ```
 calibration_test/
-├── calibration_demo.py    # Main GUI application
-├── calibration_core.py    # Calibration logic
-├── user_profiles/         # Saved calibration profiles (.pkl)
-└── README.md              # This file
+├── core/                    # Core calibration, fusion, and adapter logic
+│   ├── calibration_visual.py    # HSEmotion extractor + calibration
+│   ├── calibration_audio.py     # Emotion2Vec extractor + calibration
+│   ├── calibration_base.py      # Model-agnostic interfaces + DeepFace extractors
+│   ├── fusion.py                # Late fusion (V1 probability, V2 V-A space)
+│   ├── deepface_fusion_adapter.py  # Converts calibrated predictions for fusion
+│   └── __init__.py              # Re-exports
+├── demos/                   # GUI demo applications
+│   ├── deepface_audio_fusion_demo.py  # Main: DeepFace + Emotion2Vec fusion
+│   ├── visual_demo.py          # HSEmotion calibration
+│   ├── deepface_emb_demo.py    # DeepFace embedding calibration
+│   ├── deepface_logit_demo.py  # DeepFace neutral/smile score experiment
+│   ├── deepface_demo.py        # DeepFace identity embedding (neutral-only)
+│   ├── audio_demo.py           # Emotion2Vec audio calibration
+│   ├── fusion_demo.py          # HSEmotion + Emotion2Vec fusion (reference)
+│   └── comparison_demo.py      # Embedding vs landmark vs AU comparison
+├── tests/                   # Test scripts
+│   └── test_vad_live.py        # Standalone VAD test on live mic
+├── user_profiles/           # Saved calibration profiles (.pkl)
+└── venv/                    # Python virtual environment
 ```
 
-## How Calibration Works
+## Calibration Flow
 
-1. **Baseline Capture**: Averages 20-25 frames (last 3-4 sec of 5 sec window) for each state
-2. **Embedding Storage**: Stores 1280-dim HSEmotion embeddings for neutral, happy, calm
-3. **V-A Anchoring**: Stores your personal V-A coordinates for neutral state
-4. **Detection**: Compares live embeddings to baselines using cosine similarity
-5. **Adjustment**: Computes V-A shift relative to YOUR neutral (not model's zero)
+1. Click **Calibrate Face** → Enter user ID
+2. Show **Neutral** face (5 sec) — anchors resting face
+3. Dialog confirms → Click OK
+4. Show **Happy** face (5 sec) — establishes positive boundary
+5. System computes adaptive thresholds from inter-baseline similarity
+6. Live detection: calibration for neutral/happy, raw model for other emotions
 
-## Interpreting Results
+## Key Findings
 
-### Baseline Similarities
-- Values 0.85+ indicate strong match to that baseline
-- The closest baseline (`*` marker) influences calibrated prediction
+- **DeepFace**: Good raw classifier. Calibration works for neutral + happy. Embeddings don't separate negative emotions well.
+- **HSEmotion**: Better embeddings for calibration (1280-dim, emotion-trained). Native V-A output. Raw output already quite good.
+- **Emotion2Vec large**: Strong on sadness (80% RAVDESS). Defaults to Neutral on natural speech — handled by signal-based weighting.
+- **Fusion**: Asymmetric weighting lets audio carry the sadness signal that DeepFace misses.
 
-### V-A Shift
-- **V-shift**: Valence change from YOUR neutral (+ = more positive)
-- **A-shift**: Arousal change from YOUR neutral (+ = more activated)
+## Camera Selection
 
-### Quadrants (Russell's Circumplex)
-- **Q1**: High arousal + Positive valence (Happy/Excited)
-- **Q2**: High arousal + Negative valence (Angry/Anxious)
-- **Q3**: Low arousal + Negative valence (Sad/Depressed)
-- **Q4**: Low arousal + Positive valence (Calm/Content)
-- **Neutral**: Center (minimal shift)
-
-## Expected Behavior
-
-The calibrated output should:
-- Better distinguish YOUR subtle expressions
-- Reduce false "neutral" classifications
-- Show more stable predictions for your natural expressions
-- Correctly identify when you shift from your baseline state
+Most demos accept `--camera N`:
+- `--camera 0` — Default camera
+- `--camera 1` — Usually MacBook webcam

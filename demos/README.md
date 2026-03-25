@@ -6,11 +6,15 @@ GUI applications for testing calibration and fusion. All demos should be run fro
 
 | File | Description | Command |
 |------|-------------|---------|
-| `visual_demo.py` | Face emotion calibration. Shows raw HSEmotion output vs calibrated output side-by-side. Calibrates 3 states (neutral, happy, calm) using webcam. | `venv/bin/python demos/visual_demo.py --camera 1` |
-| `audio_demo.py` | Audio emotion calibration. Shows raw Emotion2Vec output vs calibrated output side-by-side. Uses emotion2vec_plus_large model with prediction smoothing. | `venv/bin/python demos/audio_demo.py` |
-| `fusion_demo.py` | Multimodal fusion. Runs webcam + mic simultaneously. 5-column display: Face Raw, Face Cal, Audio Raw, Audio Cal, Fused. Toggle between V1 (probability fusion) and V2 (V-A space fusion). | `venv/bin/python demos/fusion_demo.py --camera 1` |
-| `comparison_demo.py` | Compares three calibration approaches side-by-side on same camera feed: Embeddings (1280-dim, HSEmotion), Landmarks (1434-dim, MediaPipe), Action Units (8-dim, MediaPipe). Shows cosine similarity scores for each. | `venv/bin/python demos/comparison_demo.py --camera 1` |
-| `actionunits_demo.py` | Sourick's standalone AU-based calibration using MediaPipe Face Mesh. OpenCV GUI (not Tkinter). Click to capture baselines. | `venv/bin/python demos/actionunits_demo.py` |
+| `deepface_audio_fusion_demo.py` | **Main demo.** DeepFace (calibrated) + Emotion2Vec (raw) fusion. FunASR VAD for speech detection. Face EMA smoothing. Shows face raw/adapted probs, audio probs, fusion weights, and fused output. | `PYTHONPATH=. venv/bin/python demos/deepface_audio_fusion_demo.py --camera 1` |
+| `visual_demo.py` | HSEmotion face calibration. Raw vs calibrated side-by-side with V-A shift detection, adaptive thresholds, and probability bars. Calibrates neutral + happy. | `venv/bin/python demos/visual_demo.py --camera 1` |
+| `deepface_emb_demo.py` | DeepFace 1024-dim emotion embedding calibration. Neutral + happy with 2-state adaptive thresholds. Probs from DeepFace full pipeline. | `PYTHONPATH=. venv/bin/python demos/deepface_emb_demo.py --camera 1` |
+| `deepface_logit_demo.py` | DeepFace neutral/smile score experiment. Tests smile_score = log(p_happy) - log(p_neutral) as calibration signal. Finding: insufficient separation for subtle smiles. | `PYTHONPATH=. venv/bin/python demos/deepface_logit_demo.py --camera 1` |
+| `deepface_demo.py` | DeepFace identity embedding (VGG-Face 4096-dim) neutral-only calibration with variance-based threshold. | `PYTHONPATH=. venv/bin/python demos/deepface_demo.py --camera 1` |
+| `audio_demo.py` | Emotion2Vec audio calibration. Raw vs calibrated with prediction smoothing (majority vote + hysteresis). | `venv/bin/python demos/audio_demo.py` |
+| `fusion_demo.py` | HSEmotion + Emotion2Vec fusion (reference). 5-column display. V1/V2 toggle. Kept as comparison baseline. | `venv/bin/python demos/fusion_demo.py --camera 1` |
+| `comparison_demo.py` | Compares calibration approaches: Embeddings (HSEmotion 1280-dim) vs Landmarks (MediaPipe 1434-dim) vs Action Units (MediaPipe 8-dim). | `venv/bin/python demos/comparison_demo.py --camera 1` |
+| `actionunits_demo.py` | Sourick's standalone AU-based calibration using MediaPipe Face Mesh. OpenCV GUI. | `venv/bin/python demos/actionunits_demo.py` |
 
 ## Camera Selection
 
@@ -19,24 +23,18 @@ Most demos accept `--camera N`:
 - `--camera 1` — Usually MacBook webcam
 - `--camera 2` — OBS Virtual Camera or other
 
-Check available cameras:
-```bash
-venv/bin/python -c "
-import cv2
-for i in range(5):
-    cap = cv2.VideoCapture(i)
-    if cap.isOpened():
-        ret, _ = cap.read()
-        print(f'Camera {i}: {\"OK\" if ret else \"No frame\"} ')
-        cap.release()
-"
-```
+## Calibration Flow
 
-## Calibration Flow (Same for All Demos)
+### Face calibration (visual demos + fusion demo)
+1. Click **Calibrate** / **Calibrate Face** → Enter user ID
+2. Show **Neutral** face (5 sec) — anchors resting face
+3. Confirmation dialog → Click OK
+4. Show **Happy** face (5 sec) — establishes positive boundary
+5. System computes adaptive thresholds from inter-baseline similarity
+6. Live: calibration for neutral/happy, raw model fallback for other emotions
 
+### Audio (audio_demo.py only)
 1. Click **Calibrate** → Enter user ID
-2. Show **Neutral** face/voice (5-10 sec)
-3. Show **Happy** face/voice (5-10 sec)
-4. Show **Calm** face/voice (5-10 sec)
-5. System averages 20-25 frames per state, stores as user profile
-6. Live detection compares embeddings to baselines via cosine similarity
+2. Count 1-10 in **Neutral** voice (8 sec)
+3. Talk about something **Happy** (10 sec)
+4. Speak calmly for **Calm** (10 sec)
