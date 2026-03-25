@@ -21,14 +21,19 @@ from typing import Dict, Optional, Tuple
 # 7 shared emotion categories between HSEmotion (8) and Emotion2Vec (9)
 SHARED_EMOTIONS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
 
-# HSEmotion label → shared label (drops Contempt)
+# Face model label → shared label
+# Supports HSEmotion (8 classes) and DeepFace (7 classes).
+# Also tolerates calibrated labels (Happy, Sad) that may differ from raw (Happiness, Sadness).
 FACE_TO_SHARED = {
     'Anger': 'Angry',
+    'Angry': 'Angry',
     'Disgust': 'Disgust',
     'Fear': 'Fear',
     'Happiness': 'Happy',
+    'Happy': 'Happy',
     'Neutral': 'Neutral',
     'Sadness': 'Sad',
+    'Sad': 'Sad',
     'Surprise': 'Surprise',
 }
 
@@ -88,10 +93,14 @@ def align_face_probs(face_probs: Dict[str, float]) -> Dict[str, float]:
     """
     Align HSEmotion 8-class probabilities to 7 shared categories.
     Drops Contempt and renormalizes.
+
+    Sums probabilities when multiple face labels alias to the same shared
+    class (e.g. Anger + Angry → Angry) so DeepFace / HSEmotion keys are not
+    overwritten by a later alias with mass 0.
     """
-    aligned = {}
+    aligned = {em: 0.0 for em in SHARED_EMOTIONS}
     for face_name, shared_name in FACE_TO_SHARED.items():
-        aligned[shared_name] = face_probs.get(face_name, 0.0)
+        aligned[shared_name] += face_probs.get(face_name, 0.0)
 
     # Renormalize
     total = sum(aligned.values())
@@ -169,23 +178,37 @@ def compute_modality_weights(
     audio_emotion: Optional[str], audio_conf: float
 ) -> tuple:
     """
-    Signal-based modality weighting.
+    Signal-based modality weighting with asymmetric sadness bias.
 
-    Key insight: When audio says Neutral, it's usually "I don't know" rather than
-    "person is neutral." So we downweight it. But when audio detects a non-neutral
-    emotion, it might be catching something face is missing (e.g., smiling outside
-    but voice is pained), so we give it real weight.
+    Key insights:
+    - When audio says Neutral, it's usually "I don't know" → downweight.
+    - When audio detects sadness but face says neutral/happy, audio is likely
+      catching something DeepFace misses → give audio more weight.
+    - When both agree, equal trust.
     """
     if audio_emotion is None or audio_emotion == 'Neutral':
         # Audio has no signal — lean heavily on face
         return 0.85, 0.15
-    elif face_emotion is not None and audio_emotion == FACE_TO_SHARED.get(face_emotion, face_emotion):
+
+    face_shared = FACE_TO_SHARED.get(face_emotion, face_emotion) if face_emotion else None
+
+    if face_shared is not None and audio_emotion == face_shared:
         # Both agree on the same emotion — equal trust
         return 0.50, 0.50
-    else:
-        # They disagree, and audio has a non-neutral signal
-        # Audio might be catching masked emotion — give it meaningful weight
-        return 0.55, 0.45
+
+    # Audio detects sadness, face says neutral/happy → trust audio more
+    # DeepFace is known to miss sadness; Emotion2Vec is strong on it
+    if (audio_emotion == 'Sad' and audio_conf >= 0.55
+            and face_shared in ('Neutral', 'Happy')):
+        return 0.35, 0.65
+
+    # Audio detects other negative emotion, face says neutral/happy
+    if (audio_emotion in ('Angry', 'Fear', 'Disgust') and audio_conf >= 0.60
+            and face_shared in ('Neutral', 'Happy')):
+        return 0.45, 0.55
+
+    # General disagreement — audio has a non-neutral signal
+    return 0.55, 0.45
 
 
 def _default_result(fusion_version: int) -> FusionResult:

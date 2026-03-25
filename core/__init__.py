@@ -48,3 +48,5 @@ from core.calibration_base import (
     cosine_similarity,
     compute_adaptive_thresholds,
 )
+
+from core.deepface_fusion_adapter import build_face_result
