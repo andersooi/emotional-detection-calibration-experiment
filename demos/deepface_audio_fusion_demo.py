@@ -168,6 +168,9 @@ class DeepFaceAudioFusionApp:
         self.face_detector = FaceDetector()
         self.audio_capture = AudioCapture()
 
+        # Voice Activity Detection (FunASR FSMN VAD)
+        self.vad_model = None  # Loaded during init
+
         # Calibration (face only)
         self.cal_manager = GenericCalibrationManager(modality='deepface_emb')
         self.cal_detector = GenericCalibratedDetector(
@@ -509,12 +512,15 @@ class DeepFaceAudioFusionApp:
         self.progress_var.set(0)
         self.captured_frames = []
         self.cal_start_time = time.time()
+        self._cal_transitioning = False  # Allow frame capture
         self.status_label.config(
             text=f"Calibrating: {state['label']} ({state['duration']}s)")
 
     def _capture_frame_for_calibration(self, result: Dict):
         if not self.cal_in_progress or self.cal_state_idx >= len(CALIBRATION_STATES):
             return
+        if getattr(self, '_cal_transitioning', False):
+            return  # Block frames during state transition
         state = CALIBRATION_STATES[self.cal_state_idx]
         elapsed = time.time() - self.cal_start_time
         self.progress_var.set(min(100, (elapsed / state['duration']) * 100))
@@ -524,6 +530,8 @@ class DeepFaceAudioFusionApp:
             self._finalize_state_capture()
 
     def _finalize_state_capture(self):
+        if self.cal_state_idx >= len(CALIBRATION_STATES):
+            return  # Already finalized
         state = CALIBRATION_STATES[self.cal_state_idx]
         if len(self.captured_frames) < 5:
             messagebox.showwarning("Retry",
@@ -542,8 +550,17 @@ class DeepFaceAudioFusionApp:
 
         self._temp_baseline.add_state(state['name'], avg_emb)
         self.cal_state_idx += 1
-        self.captured_frames = []
-        self.root.after(500, self._start_state_capture)
+        self._cal_transitioning = True  # Block frame capture during transition
+
+        # If there's another state, prompt user before continuing
+        if self.cal_state_idx < len(CALIBRATION_STATES):
+            next_state = CALIBRATION_STATES[self.cal_state_idx]
+            messagebox.showinfo(
+                "State Captured",
+                f"{state['label']} captured!\n\n"
+                f"Next: {next_state['label']}\n"
+                f"Click OK when ready.")
+        self.root.after(200, self._start_state_capture)
 
     def _complete_calibration(self):
         self.cal_in_progress = False
@@ -649,6 +666,32 @@ class DeepFaceAudioFusionApp:
             'top_emotion': top_emotion,
             'confidence': emotion_probs[top_emotion],
         }
+
+    # ========================================================================
+    # Voice Activity Detection
+    # ========================================================================
+
+    def _has_speech(self, chunk: np.ndarray) -> bool:
+        """Run FunASR VAD on an audio chunk. Returns True if speech detected."""
+        if self.vad_model is None:
+            return True  # No VAD loaded — pass everything through
+
+        import tempfile
+        import soundfile as sf
+        import os
+
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            temp_path = f.name
+            sf.write(temp_path, chunk, SAMPLE_RATE)
+
+        try:
+            result = self.vad_model.generate(input=temp_path)
+            segments = result[0].get('value', []) if result else []
+            return len(segments) > 0
+        except Exception:
+            return True  # On error, pass through
+        finally:
+            os.unlink(temp_path)
 
     # ========================================================================
     # Display
@@ -897,10 +940,18 @@ class DeepFaceAudioFusionApp:
     def audio_loop(self):
         print("[Audio] Loop started, waiting for chunks...")
         first_result = True
+        skip_count = 0
         while self.running:
             try:
                 chunk = self.audio_capture.get_chunk(timeout=0.5)
                 if chunk is None:
+                    continue
+
+                # VAD gate: only process chunks with speech
+                if not self._has_speech(chunk):
+                    skip_count += 1
+                    if skip_count % 10 == 1:
+                        print(f"[Audio] VAD: no speech (skipped {skip_count})")
                     continue
 
                 result = self.audio_extractor.extract(chunk, SAMPLE_RATE)
@@ -946,6 +997,20 @@ class DeepFaceAudioFusionApp:
             self.audio_extractor.load(
                 status_callback=lambda msg: self.root.after(
                     0, lambda m=msg: self.status_label.config(text=m)))
+
+            self.root.after(0, lambda: self.status_label.config(
+                text="Loading VAD model..."))
+            try:
+                from funasr import AutoModel
+                self.vad_model = AutoModel(
+                    model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+                    device="cpu",
+                    disable_update=True,
+                )
+                print("[VAD] Model loaded successfully")
+            except Exception as e:
+                print(f"[VAD] Failed to load: {e}. Running without VAD.")
+                self.vad_model = None
 
             self.root.after(0, lambda: self.status_label.config(
                 text=f"Starting camera {self.camera_index}..."))
