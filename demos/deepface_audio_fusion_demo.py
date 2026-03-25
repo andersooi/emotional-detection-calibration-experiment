@@ -47,14 +47,11 @@ except ImportError:
 # ============================================================================
 
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 3.0
+CHUNK_DURATION = 2.0  # Reduced from 3s for faster audio updates (~1s between results)
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION)
 FRAMES_TO_AVERAGE = 25
-AUDIO_STALE_THRESHOLD = 5.0
+AUDIO_STALE_THRESHOLD = 4.0  # Reduced with shorter chunks (was 5s with 3s chunks)
 
-# Audio energy gate: peak 1-second window RMS below this → treat as silence.
-# From testing: background noise peak RMS ~0.002-0.013, neutral speech ~0.02-0.04+.
-AUDIO_ENERGY_THRESHOLD = 0.015
 
 CALIBRATION_STATES = [
     {'name': 'neutral', 'label': 'Neutral', 'duration': 5,
@@ -130,7 +127,7 @@ class AudioCapture:
         self.buffer = np.concatenate([self.buffer, audio_chunk])
         while len(self.buffer) >= self.chunk_samples:
             chunk = self.buffer[:self.chunk_samples]
-            self.buffer = self.buffer[self.chunk_samples // 2:]
+            self.buffer = self.buffer[self.chunk_samples // 4:]  # 75% overlap
             self.audio_queue.put(chunk)
 
     def start(self):
@@ -218,7 +215,7 @@ class DeepFaceAudioFusionApp:
         # GUI
         self.root = tk.Tk()
         self.root.title("DeepFace + Emotion2Vec Fusion")
-        self.root.geometry("1300x950")
+        self.root.geometry("1350x1100")
         self.root.configure(bg=COLORS['bg_dark'])
         self._setup_ui()
 
@@ -373,12 +370,37 @@ class DeepFaceAudioFusionApp:
             val_lbl.pack(side='left')
             self.sim_bars[state] = {'canvas': canvas, 'label': val_lbl, 'color': color}
 
-        # Raw probability bars
+        # Face probability bars — raw (before calibration adapter)
+        raw_prob_frame = tk.Frame(right, bg=COLORS['bg_medium'])
+        raw_prob_frame.pack(fill='x', pady=(5, 0))
+        tk.Label(raw_prob_frame, text="FACE RAW",
+                 font=('Helvetica', 10, 'bold'),
+                 bg=COLORS['bg_medium'], fg=COLORS['accent_red']).pack(pady=(0, 2))
+
+        self.raw_prob_bars = {}
+        for label in EMOTION_LABELS:
+            row = tk.Frame(raw_prob_frame, bg=COLORS['bg_medium'])
+            row.pack(fill='x', pady=1)
+            tk.Label(row, text=label[:8], font=('Helvetica', 8),
+                     width=10, anchor='e',
+                     bg=COLORS['bg_medium'],
+                     fg=COLORS['text_gray']).pack(side='left')
+            canvas = tk.Canvas(row, width=100, height=12,
+                               bg='#1e293b', highlightthickness=0)
+            canvas.pack(side='left', padx=(6, 2))
+            val_lbl = tk.Label(row, text="--", font=('Helvetica', 7),
+                               width=5, bg=COLORS['bg_medium'],
+                               fg=COLORS['text_gray'])
+            val_lbl.pack(side='left')
+            self.raw_prob_bars[label] = {'canvas': canvas, 'val': val_lbl,
+                                         'color': EMOTION_COLORS[label]}
+
+        # Face probability bars — adapted (after calibration adapter, what fusion sees)
         prob_frame = tk.Frame(right, bg=COLORS['bg_medium'])
         prob_frame.pack(fill='both', expand=True, pady=(5, 0))
-        tk.Label(prob_frame, text="FACE PROBABILITIES (adapted)",
+        tk.Label(prob_frame, text="FACE ADAPTED (into fusion)",
                  font=('Helvetica', 10, 'bold'),
-                 bg=COLORS['bg_medium'], fg=COLORS['text_white']).pack(pady=(0, 4))
+                 bg=COLORS['bg_medium'], fg=COLORS['accent_green']).pack(pady=(0, 2))
 
         self.prob_bars = {}
         for label in EMOTION_LABELS:
@@ -721,7 +743,23 @@ class DeepFaceAudioFusionApp:
                 self.sim_bars[state]['canvas'].delete('all')
                 self.sim_bars[state]['label'].config(text="--")
 
-        # Probability bars (show adapted face probs going into fusion)
+        # Raw face probability bars (before adapter)
+        if face_raw:
+            rprobs = face_raw.get('emotion_probs', {})
+            for label, bars in self.raw_prob_bars.items():
+                p = rprobs.get(label, 0.0)
+                bars['canvas'].delete('all')
+                bw = max(0, min(100, int(100 * p)))
+                if bw > 0:
+                    bars['canvas'].create_rectangle(
+                        0, 0, bw, 12, fill=bars['color'], outline='')
+                bars['val'].config(text=f"{p:.0%}")
+        else:
+            for bars in self.raw_prob_bars.values():
+                bars['canvas'].delete('all')
+                bars['val'].config(text="--")
+
+        # Adapted face probability bars (what fusion sees)
         if face_for_fusion:
             probs = face_for_fusion.get('emotion_probs', {})
             for label, bars in self.prob_bars.items():
@@ -865,34 +903,11 @@ class DeepFaceAudioFusionApp:
                 if chunk is None:
                     continue
 
-                # Energy gate: check peak 1-second window RMS within the chunk.
-                # Using peak window avoids dilution when speech starts mid-chunk
-                # (half-silence + half-speech would average to below threshold).
-                window_size = min(SAMPLE_RATE, len(chunk))  # 1 second
-                if len(chunk) > window_size:
-                    # Slide in steps of 0.25s, find loudest window
-                    step = SAMPLE_RATE // 4
-                    max_rms = 0.0
-                    for i in range(0, len(chunk) - window_size + 1, step):
-                        w = chunk[i:i + window_size]
-                        max_rms = max(max_rms, float(np.sqrt(np.mean(w ** 2))))
-                    rms = max_rms
-                else:
-                    rms = float(np.sqrt(np.mean(chunk ** 2)))
-
-                if rms < AUDIO_ENERGY_THRESHOLD:
-                    if not hasattr(self, '_skip_count'):
-                        self._skip_count = 0
-                    self._skip_count += 1
-                    if self._skip_count % 10 == 1:
-                        print(f"[Audio] Skipped (peak_rms={rms:.4f} < {AUDIO_ENERGY_THRESHOLD})")
-                    continue
-
                 result = self.audio_extractor.extract(chunk, SAMPLE_RATE)
 
                 if first_result:
                     print(f"[Audio] First result: {result.get('top_emotion')} "
-                          f"{result.get('confidence', 0):.0%} (rms={rms:.4f})")
+                          f"{result.get('confidence', 0):.0%}")
                     first_result = False
 
                 with self._lock:
