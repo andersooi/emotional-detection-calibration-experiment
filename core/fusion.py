@@ -196,16 +196,12 @@ def compute_modality_weights(
         # Both agree on the same emotion — equal trust
         return 0.50, 0.50
 
-    # Audio detects sadness, face says neutral/happy → trust audio more
-    # DeepFace is known to miss sadness; Emotion2Vec is strong on it
-    if (audio_emotion == 'Sad' and audio_conf >= 0.55
-            and face_shared in ('Neutral', 'Happy')):
+    # Audio detects negative emotion with high confidence → trust audio more.
+    # DeepFace struggles with negative emotions (0-18% on Disgust/Fear/Sad)
+    # and often misclassifies them as other emotions (e.g., Disgust→Angry).
+    # Emotion2Vec is consistently stronger (~50-88%) on these categories.
+    if (audio_emotion in ('Sad', 'Angry', 'Fear', 'Disgust') and audio_conf >= 0.50):
         return 0.35, 0.65
-
-    # Audio detects other negative emotion, face says neutral/happy
-    if (audio_emotion in ('Angry', 'Fear', 'Disgust') and audio_conf >= 0.60
-            and face_shared in ('Neutral', 'Happy')):
-        return 0.45, 0.55
 
     # General disagreement — audio has a non-neutral signal
     return 0.55, 0.45
