@@ -178,13 +178,14 @@ def compute_modality_weights(
     audio_emotion: Optional[str], audio_conf: float
 ) -> tuple:
     """
-    Signal-based modality weighting with asymmetric sadness bias.
+    Signal-based modality weighting (V3: Happy-protected audio boost).
 
-    Key insights:
-    - When audio says Neutral, it's usually "I don't know" → downweight.
-    - When audio detects sadness but face says neutral/happy, audio is likely
-      catching something DeepFace misses → give audio more weight.
-    - When both agree, equal trust.
+    Rules:
+    - Audio Neutral/None → 85/15 face-heavy (audio has no signal)
+    - Agreement → 50/50
+    - Audio negative + face NOT Happy → 35/65 audio-heavy (rescue negative emotions)
+    - Audio negative + face IS Happy → 55/45 (protect Happy, DeepFace's strongest class)
+    - General disagreement → 55/45 face-slight
     """
     if audio_emotion is None or audio_emotion == 'Neutral':
         # Audio has no signal — lean heavily on face
@@ -196,14 +197,18 @@ def compute_modality_weights(
         # Both agree on the same emotion — equal trust
         return 0.50, 0.50
 
-    # Audio detects negative emotion with high confidence → trust audio more.
+    # Audio detects negative emotion → trust audio more, but protect Happy.
     # DeepFace struggles with negative emotions (0-18% on Disgust/Fear/Sad)
     # and often misclassifies them as other emotions (e.g., Disgust→Angry).
-    # Emotion2Vec is consistently stronger (~50-88%) on these categories.
-    if (audio_emotion in ('Sad', 'Angry', 'Fear', 'Disgust') and audio_conf >= 0.50):
+    # However, DeepFace is strong on Happy (80%) — when face says Happy,
+    # don't let audio's false-negative signal override it.
+    if (audio_emotion in ('Sad', 'Angry', 'Fear', 'Disgust')
+            and audio_conf >= 0.50
+            and face_shared != 'Happy'):
         return 0.35, 0.65
 
     # General disagreement — audio has a non-neutral signal
+    # Also covers: audio negative + face Happy (protect Happy)
     return 0.55, 0.45
 
 
