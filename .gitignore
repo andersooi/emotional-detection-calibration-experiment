@@ -16,10 +16,15 @@ user_profiles/*.pkl
 .idea/
 .vscode/
 
-# Model files
-models/
+# Large model files (downloaded at runtime)
 *.task
-*.pt
+
+# Data (downloaded datasets, cached features)
+data/
+
+# Log files
+*.txt
+!README.md
 
 # Presentation files
 presentation/
